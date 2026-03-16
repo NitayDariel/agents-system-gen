@@ -1,0 +1,25 @@
+# Environment variables
+.env
+.env.*
+
+# Agent run logs (generated output, not source)
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# Improvement data (generated state, not source)
+improvement/decision_journal.json
+improvement/backlog.json

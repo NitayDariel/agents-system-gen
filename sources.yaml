@@ -1,0 +1,369 @@
+# sources.yaml — Researcher Agent Source Tier List
+# Maintained by: System Improvement Agent (quarterly review recommended)
+# Last updated: 2025-03
+#
+# HOW THIS FILE IS USED:
+#   Layer 1 — Query crafting (no file needed, built into query discipline)
+#   Layer 2 — Snippet screening: check domain against this file BEFORE fetching
+#   Layer 3 — THIS FILE: tier assignment and publication lists
+#   Layer 4 — Content evaluation: only for unrecognized sources on high-stakes claims
+#
+# TIER LOGIC:
+#   tier_1   → fetch and proceed, minimal verification needed
+#   tier_2   → fetch and verify specific claims before treating as confirmed
+#   tier_3   → skip by default; fetch only if no tier_1/tier_2 alternative exists
+#              AND claim is low-stakes AND explicitly tag output as assumed
+#
+# PUBLICATION LOGIC:
+#   white    → priority fetch — worth checking first, but STILL requires claim-level tagging
+#              Not a trust bypass. A priority signal only.
+#   black    → skip by default — known low-quality, SEO-driven, or content farm
+#              Not an absolute block. If it's the only result on a low-stakes claim,
+#              fetch and tag as assumed. Never use as sole source for confirmed claims.
+
+# ─────────────────────────────────────────────────────────────
+# TIER 1 — High trust, fetch and proceed
+# ─────────────────────────────────────────────────────────────
+tier_1:
+
+  academic_and_research:
+    - arxiv.org               # preprints — note: not peer reviewed, tag accordingly
+    - pubmed.ncbi.nlm.nih.gov
+    - scholar.google.com      # index only — follow to source domain
+    - semanticscholar.org
+    - ssrn.com                # preprints — tag as not-yet-peer-reviewed
+    - jstor.org
+    - acm.org
+    - ieee.org
+    - openreview.net          # ML/AI papers
+
+  government_and_regulatory:
+    - nist.gov
+    - cisa.gov
+    - ftc.gov
+    - sec.gov
+    - fda.gov
+    - cdc.gov
+    - who.int
+    - europa.eu
+    - eur-lex.europa.eu       # EU legislation primary source
+    - regulations.gov
+    - congress.gov
+    - federalregister.gov
+
+  institutional_and_think_tanks:
+    - hai.stanford.edu        # Stanford HAI — AI index, research
+    - brookings.edu
+    - rand.org
+    - chathamhouse.org
+    - cfr.org                 # Council on Foreign Relations
+    - wilsoncenter.org
+    - csis.org
+    - oecd.org
+    - worldbank.org
+    - bis.org                 # Bank for International Settlements
+
+  official_technical_documentation:
+    # Pattern: docs.*, developer.*, *.readthedocs.io
+    - docs.python.org
+    - developer.mozilla.org
+    - docs.aws.amazon.com
+    - cloud.google.com/docs
+    - docs.microsoft.com
+    - docs.anthropic.com
+    - langchain.com           # official docs only
+    - langgraph.com
+
+  financial_and_economic_primary:
+    - federalreserve.gov
+    - bls.gov                 # Bureau of Labor Statistics
+    - census.gov
+    - imf.org
+    - fred.stlouisfed.org     # economic data
+
+# ─────────────────────────────────────────────────────────────
+# TIER 2 — Fetch and verify specific claims
+# News, quality tech publications, credible analysis
+# ─────────────────────────────────────────────────────────────
+tier_2:
+
+  news_general:
+    # Moved from tier_1: editorial bias and framing possible on contested topics
+    - reuters.com
+    - apnews.com
+    - bbc.com
+    - economist.com
+    - ft.com                  # Financial Times
+    - wsj.com
+    - nytimes.com
+    - washingtonpost.com
+    - theguardian.com
+    - npr.org
+
+  tech_and_science_journalism:
+    - arstechnica.com         # consistently high technical quality
+    - theregister.com         # enterprise tech, critical lens
+    - technologyreview.com    # MIT Tech Review
+    - spectrum.ieee.org
+    - sciencedaily.com        # summaries — follow to source paper
+    - nature.com/news         # news section only; nature.com articles = tier_1
+    - newscientist.com
+
+  cybersecurity_specific:
+    - krebsonsecurity.com     # Brian Krebs — high credibility
+    - schneier.com            # Bruce Schneier — high credibility
+    - darkreading.com
+    - bleepingcomputer.com
+    - threatpost.com
+    - thehackernews.com
+    - securityweek.com
+
+  ai_and_ml_specific:
+    - openai.com/blog
+    - anthropic.com/research
+    - deepmind.google
+    - huggingface.co/blog
+    - ai.googleblog.com
+    - bair.berkeley.edu/blog  # Berkeley AI Research
+    - alignmentforum.org      # AI safety — verify claims carefully, some speculative
+    - lesswrong.com           # verify carefully — opinion-heavy
+
+  professional_and_analytical:
+    - hbr.org                 # Harvard Business Review
+    - foreignaffairs.com
+    - foreignpolicy.com
+    - mckinsey.com/insights   # note: often optimistic on AI — verify numbers
+    - gartner.com             # analyst reports — paywalled, use snippets carefully
+
+  credible_independent:
+    - simonwillison.net       # AI/tech — high signal, well-sourced
+    - stratechery.com         # tech strategy — opinionated but rigorous
+
+# ─────────────────────────────────────────────────────────────
+# TIER 3 — Avoid by default
+# ─────────────────────────────────────────────────────────────
+tier_3:
+
+  notes: >
+    These are not absolute blocks. Fetch only when:
+    (a) no tier_1 or tier_2 source covers the claim,
+    (b) the claim is low-stakes or background only,
+    (c) the output is tagged as assumed and flagged.
+    Never use as sole source for a confirmed claim.
+
+  domains:
+    - reddit.com              # useful for anecdote/community signal, not factual claims
+    - quora.com
+    - wikipedia.org           # use as index to sources, not as source itself
+    - fandom.com
+
+# ─────────────────────────────────────────────────────────────
+# PUBLICATION WHITELIST — Priority fetch, not trust bypass
+# ─────────────────────────────────────────────────────────────
+publications:
+
+  white:
+    notes: >
+      When a search result comes from one of these publications,
+      prioritize fetching it over unknown sources.
+      White label = worth your attention first.
+      Still requires claim-level tagging. Not a verification bypass.
+
+    list:
+      - name: Nature
+        domain: nature.com
+        strong_for: [science, biology, medicine, climate, AI research]
+        note: news section = tier_2; research articles = tier_1
+
+      - name: MIT Technology Review
+        domain: technologyreview.com
+        strong_for: [AI, emerging tech, policy implications]
+        note: editorial quality high; watch for sponsored content sections
+
+      - name: The Economist
+        domain: economist.com
+        strong_for: [economics, geopolitics, technology policy]
+        note: opinionated framing — verify statistics independently
+
+      - name: Foreign Affairs
+        domain: foreignaffairs.com
+        strong_for: [geopolitics, international relations, policy]
+        note: expert authors, peer-reviewed-adjacent quality
+
+      - name: Wired
+        domain: wired.com
+        strong_for: [tech culture, AI, cybersecurity, digital policy]
+        note: quality varies by author — check byline on consequential claims
+
+      - name: Ars Technica
+        domain: arstechnica.com
+        strong_for: [technical depth, security, hardware, software]
+        note: consistently rigorous; good primary for technical claims
+
+      - name: Stanford HAI
+        domain: hai.stanford.edu
+        strong_for: [AI research, AI index data, AI policy]
+        note: institutional source — treat as tier_1 for AI-specific data
+
+      - name: Krebs on Security
+        domain: krebsonsecurity.com
+        strong_for: [cybersecurity incidents, threat intel, fraud]
+        note: primary reporting, not aggregation — high credibility for security
+
+      - name: Brookings Institution
+        domain: brookings.edu
+        strong_for: [policy analysis, governance, economics, AI regulation]
+        note: center-leaning — note author affiliation on politically charged topics
+
+      - name: RAND Corporation
+        domain: rand.org
+        strong_for: [defense, security policy, tech policy, quantitative analysis]
+        note: DoD-funded — note potential framing on defense-adjacent topics
+
+  # ─────────────────────────────────────────────────────────────
+  # PUBLICATION BLACKLIST — Skip by default
+  # ─────────────────────────────────────────────────────────────
+  black:
+    notes: >
+      Known SEO-driven, thin-content, or AI-generated spam publications.
+      Skip at snippet stage before fetching.
+      Default = skip. Exception = low-stakes background claim, no alternative,
+      output explicitly tagged assumed.
+      This list degrades over time. System Improvement Agent reviews quarterly.
+
+    list:
+      - name: MakeUseOf
+        domain: makeuseof.com
+        reason: high-volume SEO content farm, thin technical depth
+
+      - name: Digital Trends
+        domain: digitaltrends.com
+        reason: SEO-optimized listicles, low original reporting
+
+      - name: Tom's Guide
+        domain: tomsguide.com
+        reason: thin product content, SEO-driven
+
+      - name: BuzzFeed
+        domain: buzzfeed.com
+        reason: low editorial standards, aggregation over original reporting
+
+      - name: Business Insider
+        domain: businessinsider.com
+        reason: clickbait framing, aggregated content over original; exceptions exist for
+                named expert interviews — evaluate by byline if no alternative
+
+      - name: HuffPost
+        domain: huffpost.com
+        reason: opinion-heavy, low factual rigor on technical topics
+
+      - name: Screen Rant
+        domain: screenrant.com
+        reason: entertainment SEO farm, irrelevant to most research tasks
+
+      - name: Lifehacker
+        domain: lifehacker.com
+        reason: content volume over depth, SEO-optimized
+
+      - name: TechRadar
+        domain: techradar.com
+        reason: declining quality, heavy affiliate content
+
+      - name: GadgetHacks
+        domain: gadgethacks.com
+        reason: thin content, SEO-driven tutorials
+
+      - name: Scribd (unverified uploads)
+        domain: scribd.com
+        reason: unverified user uploads — author and accuracy unknown; use only
+                if the document is a known primary source (e.g. corporate report)
+
+      - name: SlideShare
+        domain: slideshare.net
+        reason: unverified presentations — treat same as scribd
+
+      - name: eHow / Leaf Group
+        domain: ehow.com
+        reason: legacy content farm
+
+# ─────────────────────────────────────────────────────────────
+# DOMAIN PATTERN RULES
+# Applied at snippet-screening stage without per-domain lookup
+# ─────────────────────────────────────────────────────────────
+domain_patterns:
+
+  trusted_suffixes:
+    - .gov          # government — tier_1 default
+    - .edu          # academic institution — tier_1 default
+    - .ac.uk        # UK academic — tier_1 default
+    - .ac.il        # Israeli academic — tier_1 default
+    - .org          # verify: legitimate orgs and junk blogs both use .org
+                    # .org alone is NOT a trust signal — check full domain
+
+  trusted_prefixes:
+    - docs.         # official documentation
+    - developer.    # official developer documentation
+    - research.     # institutional research subdomain
+    - papers.       # paper repositories
+
+  spam_signals:
+    # Skip at snippet stage if URL matches these patterns
+    - contains: "/best-[0-9]"        # "best 10 tools" SEO listicles
+    - contains: "/top-[0-9]"         # "top 5" SEO listicles
+    - contains: "?utm_source"        # tracking params in search results = ad content
+    - contains: "/sponsored/"        # explicitly sponsored content
+    - pattern: "[0-9]{5,}"           # random number strings in URL path = auto-generated
+
+# ─────────────────────────────────────────────────────────────
+# CLAIM TYPE RULES
+# Governs verification depth required per claim type
+# ─────────────────────────────────────────────────────────────
+claim_rules:
+
+  specific_statistic_or_data:
+    minimum_source_tier: 1
+    date_required: true
+    note: must trace to primary source — no secondary summaries of statistics
+
+  recent_development:
+    minimum_source_tier: 2
+    date_required: true
+    cutoff_days: 180
+    note: if source is older than 180 days on a fast-moving topic, tag as potentially stale
+
+  technical_implementation:
+    minimum_source_tier: 2
+    preferred: official_documentation
+    note: prefer docs.* or developer.* domains over blog explanations
+
+  regulatory_or_legal:
+    minimum_source_tier: 1
+    preferred: government_or_regulatory
+    note: always cite primary regulation text, not summaries of it
+
+  conceptual_or_background:
+    minimum_source_tier: 2
+    date_required: false
+    note: tier_2 acceptable; tag as background knowledge not primary evidence
+
+  expert_opinion:
+    minimum_source_tier: 2
+    note: tag explicitly as opinion, not fact — regardless of source credibility
+
+# ─────────────────────────────────────────────────────────────
+# MAINTENANCE NOTES
+# ─────────────────────────────────────────────────────────────
+maintenance:
+
+  review_trigger: >
+    System Improvement Agent flags this file for review when:
+    (a) Critic rejects Researcher output citing source quality 3+ times in a period
+    (b) A blacklisted domain is the only available source on a recurring research topic
+    (c) A whitelisted domain produces claims that repeatedly fail Critic checks
+    (d) Quarterly schedule regardless of (a)-(c)
+
+  update_process: >
+    Additions to blacklist require: domain name, reason, date added.
+    Removals from blacklist require: evidence of quality improvement, date.
+    Tier changes require: 2+ examples justifying the change.
+    All changes logged in improvement/sources_changelog.md
