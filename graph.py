@@ -9,7 +9,7 @@ Wires all custom agents into a directed workflow. Each node:
 
 Routing:
   - Conditional edges read state fields set by nodes
-  - Human checkpoints use interrupt_before=["human_checkpoint"]
+  - Human checkpoints use interrupt() inside human_checkpoint node with MemorySaver
   - Thinker→Critic retry loop bounded by thinker_retry_count (max 3)
   - QA retry bounded by qa_retry_count[task_id] (max 2)
 
@@ -21,7 +21,7 @@ Or with human-in-the-loop:
     # Runs until interrupt
     partial = app.invoke(initial_state)
     # Human reviews, then resume:
-    final = app.invoke(Command(resume={"human_decision": "proceed"}), config)
+    final = app.invoke(Command(resume="proceed"), config)
 """
 
 import json
@@ -31,6 +31,7 @@ from typing import Optional
 
 from langgraph.graph import StateGraph, END
 from langgraph.types import Command, interrupt
+from langgraph.checkpoint.memory import MemorySaver
 
 from state import AgentSystemState
 
@@ -192,10 +193,16 @@ def thinker(state: AgentSystemState) -> AgentSystemState:
         telos_path = state.get("telos_source_path", str(TELOS_PATH))
         telos_content = Path(telos_path).read_text()
 
-    # PRIOR_OUTPUT: inject researcher findings when returning from Researcher,
-    # or Critic summary when looping through Thinker→Critic.
+    # PRIOR_OUTPUT: inject human clarification, researcher findings, or Critic summary
+    # in priority order.
     prior_output = ""
-    if state.get("researcher_findings") and state.get("research_commissioner") == "thinker":
+    if state.get("checkpoint_type") == "thinker_needs_clarification" and state.get("human_decision"):
+        # Retry after human answered clarification questions
+        prior_output = (
+            f"HUMAN CLARIFICATION RESPONSE: {state.get('human_decision')}\n"
+            f"The human has answered your questions. Now produce a concrete, actionable plan."
+        )
+    elif state.get("researcher_findings") and state.get("research_commissioner") == "thinker":
         findings = state.get("researcher_findings", [])
         r_summary = state.get("researcher_packet", {}).get("summary", "")
         prior_output = (
@@ -233,7 +240,14 @@ def thinker(state: AgentSystemState) -> AgentSystemState:
         "thinker_log_ref": packet.get("log_ref", ""),
         "thinker_retry_count": state.get("thinker_retry_count", 0),  # incremented by critic node
         "research_commissioner": "thinker",
+        # Clear any previous checkpoint/clarification state on each Thinker run
+        "checkpoint_type": None,
+        "human_decision": None,
     }
+    if packet.get("status") == "needs_human_input":
+        updates["checkpoint_type"] = "thinker_needs_clarification"
+        updates["checkpoint_stage"] = "thinker_needs_clarification"
+        updates["checkpoint_required"] = True
     if first_research_step:
         updates["research_commission"] = first_research_step["researcher_commission"]
 
@@ -617,6 +631,9 @@ def route_after_checkpoint(state: AgentSystemState) -> str:
     # proceed — route based on what triggered the checkpoint
     checkpoint_type = state.get("checkpoint_type")
 
+    if checkpoint_type == "thinker_needs_clarification":
+        return "thinker"  # re-run Thinker with human's clarification in prior_output
+
     if checkpoint_type == "thinker_plan_review":
         return "lead_engineer"
     if checkpoint_type == "critic_verdict_review":
@@ -774,9 +791,9 @@ def build_graph() -> StateGraph:
     return g
 
 
-# Compile with interrupt_before human checkpoint
+# Compile with MemorySaver — required for interrupt() to work inside nodes
 graph = build_graph()
-app = graph.compile(interrupt_before=["human_checkpoint"])
+app = graph.compile(checkpointer=MemorySaver())
 
 
 # ─────────────────────────────────────────────
@@ -787,7 +804,7 @@ if __name__ == "__main__":
     import sys
     import datetime
 
-    human_message = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else input("Human: ")
+    human_message = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else input("Task: ")
 
     initial_state: AgentSystemState = {
         "today": datetime.date.today().isoformat(),
@@ -798,7 +815,6 @@ if __name__ == "__main__":
         "pending_research": [],
         "prior_qa_failures": [],
         "completed": False,
-        # Set paths from environment or defaults
         "logs_directory": "./logs",
         "progress_file": "./project/progress.md",
         "adl_file": "./project/adr_log.md",
@@ -808,7 +824,40 @@ if __name__ == "__main__":
         "prior_backlog": "./improvement/backlog.json",
     }
 
-    print(f"\n\n\n\n\n\n * Starting agent system with: {human_message}...\n\n\n\n\n\n")
+    config = {"configurable": {"thread_id": "main"}}
+    print(f"\n\n * Starting agent system with: {human_message}...\n\n")
 
-    final = app.invoke(initial_state)
-    print("Done.")
+    app.invoke(initial_state, config=config)
+
+    # Interrupt loop — runs until graph reaches END or user stops it
+    while True:
+        snapshot = app.get_state(config)
+        if not snapshot.next:
+            # Graph reached END naturally
+            break
+
+        # Graph is paused at a checkpoint — get human input and resume
+        state_vals = snapshot.values
+        checkpoint_type = state_vals.get("checkpoint_type", "")
+
+        print("\n" + "─" * 52, flush=True)
+
+        if checkpoint_type == "thinker_needs_clarification":
+            # Show thinker's clarification questions directly
+            thinker_pkt = state_vals.get("thinker_packet", {})
+            blockers = thinker_pkt.get("blockers", [])
+            print("⏸️  CLARIFICATION NEEDED", flush=True)
+            if blockers:
+                print("", flush=True)
+                for b in blockers:
+                    print(f"  • {b}", flush=True)
+            print("\nAnswer the above (or type 'proceed' to let the system assume):", flush=True)
+        else:
+            print(f"⏸️  CHECKPOINT: {state_vals.get('checkpoint_stage', 'unknown')}", flush=True)
+            print("Options: proceed / pause / redirect", flush=True)
+
+        print("─" * 52, flush=True)
+        human_response = input("> ").strip() or "proceed"
+        app.invoke(Command(resume=human_response), config=config)
+
+    print("\n✅ Workflow complete.\n", flush=True)

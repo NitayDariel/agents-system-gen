@@ -17,6 +17,7 @@ AgentStatus = Literal["complete", "blocked", "needs_human_input", "needs_researc
 TaskType = Literal["project_work", "goal_setting", "project_definition", "strategy"]
 CheckpointType = Literal[
     "thinker_plan_review",
+    "thinker_needs_clarification",
     "critic_verdict_review",
     "qa_pass_merge_approval",
     "integration_failure_review",
