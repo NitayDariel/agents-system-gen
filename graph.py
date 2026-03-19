@@ -135,7 +135,7 @@ def _run_agent(agent_prompt: str, injection: str, model: Optional[str] = None) -
         ) from e
 
     if VERBOSE:
-        ui.packet_json(packet)
+        ui.packet_tree(packet)
 
     return packet
 
@@ -210,6 +210,7 @@ def communicator_inbound(state: AgentSystemState) -> AgentSystemState:
     with ui.spinner("Parsing input..."):
         packet = _run_agent(prompt, injection, AGENT_MODELS["communicator"])
     ui.agent_result(packet.get("task_type", "?"), packet.get("task", ""))
+    ui.log_link(packet.get("log_ref", ""))
 
     # ── Early clarification: pause BEFORE expensive downstream calls ───────
     if packet.get("clarification_asked") and not packet.get("ready_to_proceed", True):
@@ -276,6 +277,7 @@ def thinker(state: AgentSystemState) -> AgentSystemState:
     with ui.spinner("Planning..."):
         packet = _run_agent(prompt, injection, AGENT_MODELS["thinker"])
     ui.agent_result(packet.get("status", "?"), packet.get("summary", ""))
+    ui.log_link(packet.get("log_ref", ""))
 
     plan = packet.get("plan", [])
 
@@ -336,6 +338,7 @@ def critic(state: AgentSystemState) -> AgentSystemState:
     with ui.spinner("Reviewing plan..."):
         packet = _run_agent(prompt, injection, AGENT_MODELS["critic"])
     ui.agent_result(packet.get("verdict", "?"), packet.get("summary", ""))
+    ui.log_link(packet.get("log_ref", ""))
 
     verdict = packet.get("verdict", "approved")
     # Increment here so route_after_critic reads the updated count (not pre-thinker count)
@@ -374,6 +377,7 @@ def researcher(state: AgentSystemState) -> AgentSystemState:
         packet = _run_agent(prompt, injection, AGENT_MODELS["researcher"])
     n = len(packet.get("findings", []))
     ui.agent_result(packet.get("status", "?"), f"{n} finding(s). {packet.get('summary', '')}")
+    ui.log_link(packet.get("log_ref", ""))
 
     # Accumulate findings across all commissions (don't overwrite)
     existing_findings = state.get("researcher_findings", [])
@@ -431,6 +435,7 @@ def lead_engineer(state: AgentSystemState) -> AgentSystemState:
         packet = _run_agent(prompt, injection, AGENT_MODELS["lead_engineer"])
     n = len(packet.get("tasks", []))
     ui.agent_result(packet.get("status", "?"), f"{n} task(s) defined. {packet.get('summary', '')}")
+    ui.log_link(packet.get("log_ref", ""))
 
     tasks = packet.get("tasks", [])
     return {
@@ -469,6 +474,7 @@ def developer(state: AgentSystemState) -> AgentSystemState:
     with ui.spinner(f"Implementing {task_id}..."):
         packet = _run_agent(prompt, injection, AGENT_MODELS["developer"])
     ui.agent_result(packet.get("status", "?"), packet.get("summary", ""))
+    ui.log_link(packet.get("log_ref", ""))
 
     updates: AgentSystemState = {
         "agent_flow": state.get("agent_flow", []) + ["dev"],
@@ -505,6 +511,7 @@ def qa(state: AgentSystemState) -> AgentSystemState:
     status = packet.get("status", "?")
     n_fail = len([f for f in packet.get("findings", []) if f.get("severity") in ("p0", "p1")])
     ui.agent_result(status, f"{n_fail} blocking finding(s). {packet.get('summary', '')}")
+    ui.log_link(packet.get("log_ref", ""))
 
     # Track per-task retry count
     task_id = task.get("task_id", "unknown")
@@ -552,8 +559,8 @@ def integration_agent(state: AgentSystemState) -> AgentSystemState:
     )
     packet = _run_agent(prompt, injection, AGENT_MODELS["integration_agent"])
     ui.agent_result(packet.get("status", "?"), packet.get("summary", ""))
-
     log_ref = packet.get("log_ref", "")
+    ui.log_link(log_ref)
     return {
         "agent_flow": state.get("agent_flow", []) + ["integration"],
         "integration_status": packet.get("status", "pass"),
@@ -580,6 +587,7 @@ def system_improvement_agent(state: AgentSystemState) -> AgentSystemState:
     with ui.spinner("SIA auditing system logs..."):
         packet = _run_agent(prompt, injection, AGENT_MODELS["system_improvement_agent"])
     ui.agent_result(packet.get("system_health", "?"), packet.get("summary", ""))
+    ui.log_link(packet.get("log_ref", ""))
 
     return {
         "agent_flow": state.get("agent_flow", []) + ["sia"],

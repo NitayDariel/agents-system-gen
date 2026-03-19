@@ -10,7 +10,9 @@ Usage:
 """
 
 import json
+import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Optional
 
 from rich.console import Console
@@ -18,6 +20,7 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.text import Text
+from rich.tree import Tree
 
 # ─────────────────────────────────────────────
 # Color palette — one color per agent type
@@ -41,34 +44,83 @@ AGENT_COLORS: dict[str, str] = {
 # Single shared console — all output goes through this
 console = Console(highlight=False)
 
+# ─────────────────────────────────────────────
+# Timing state (module-level, reset per run)
+# ─────────────────────────────────────────────
+
+_last_start: Optional[float] = None   # set by agent_header, consumed by agent_result
+_run_start: Optional[float] = None    # set by run_start, consumed by run_complete
+
 
 # ─────────────────────────────────────────────
 # Agent output helpers
 # ─────────────────────────────────────────────
 
 def agent_header(emoji: str, name: str, model: str = "", detail: str = "") -> None:
-    """Print a styled agent header line (replaces the opening print in each node)."""
+    """Print a styled agent header line and start per-agent timer."""
+    global _last_start
+    _last_start = time.monotonic()
     model_str = f"[dim]/{model}[/dim]" if model else ""
     detail_str = f" [dim]{detail}[/dim]" if detail else ""
     console.print(f"\n{emoji} [bold white]{name}[/bold white]{model_str}{detail_str}")
 
 
 def agent_result(status: str, summary: str) -> None:
-    """Print a color-coded result line after an agent finishes."""
+    """Print a color-coded result line with elapsed time."""
+    global _last_start
     status_lower = (status or "").lower()
-    if status_lower in ("complete", "pass", "approved", "synthesized", "pass_with_notes"):
+    if status_lower in ("complete", "pass", "approved", "synthesized", "pass_with_notes", "healthy"):
         icon, color = "✓", "green"
     elif status_lower in ("fail", "reject", "blocked"):
         icon, color = "✗", "red"
-    elif status_lower in ("revise", "needs_human_input", "needs_clarification", "needs_research"):
+    elif status_lower in ("revise", "needs_human_input", "needs_clarification", "needs_research",
+                          "degrading", "critical"):
         icon, color = "⚠", "yellow"
     else:
         icon, color = "·", "dim white"
-    console.print(f"   [{color}]{icon}[/{color}] [dim]{status}[/dim] — {summary}")
+
+    elapsed_str = ""
+    if _last_start is not None:
+        elapsed = time.monotonic() - _last_start
+        elapsed_str = f" [dim]({elapsed:.1f}s)[/dim]"
+        _last_start = None
+
+    console.print(f"   [{color}]{icon}[/{color}] [dim]{status}[/dim] — {summary}{elapsed_str}")
+
+
+def log_link(path: str) -> None:
+    """Print a dim clickable file:// link to an agent log file."""
+    if not path or path.lower() in ("none", "n/a", ""):
+        return
+    abs_path = str(Path(path).resolve())
+    console.print(f"   [dim][link=file://{abs_path}]📄 {path}[/link][/dim]")
+
+
+def packet_tree(packet: dict) -> None:
+    """Rich Tree display of key packet fields (readable alternative to raw JSON)."""
+    tree = Tree("[dim]packet[/dim]")
+    priority_keys = ["status", "verdict", "summary", "real_question", "log_ref", "key_outputs",
+                     "system_health", "immediate_tasks"]
+    for key in priority_keys:
+        if key not in packet:
+            continue
+        val = packet[key]
+        if isinstance(val, list):
+            branch = tree.add(f"[dim]{key}[/dim]")
+            for item in val[:5]:
+                branch.add(f"[dim]{str(item)[:100]}[/dim]")
+            if len(val) > 5:
+                branch.add(f"[dim]… +{len(val) - 5} more[/dim]")
+        else:
+            tree.add(f"[dim]{key}:[/dim] {str(val)[:120]}")
+    other_keys = [k for k in packet if k not in priority_keys]
+    if other_keys:
+        tree.add(f"[dim]+{len(other_keys)} more field(s)[/dim]")
+    console.print(tree)
 
 
 def packet_json(packet: dict) -> None:
-    """Syntax-highlighted JSON packet dump (replaces raw json.dumps print)."""
+    """Syntax-highlighted JSON packet dump (full, for debugging)."""
     syntax = Syntax(
         json.dumps(packet, indent=2),
         "json",
@@ -94,7 +146,7 @@ def error(msg: str) -> None:
 # ─────────────────────────────────────────────
 
 def clarification_panel(question: str) -> None:
-    """Render a clarification question as a yellow panel, then prompt for input."""
+    """Render a clarification question as a yellow panel."""
     console.print()
     console.print(Panel(
         f"[bold white]{question}[/bold white]",
@@ -164,7 +216,10 @@ def flow_summary(flow: list) -> None:
 # ─────────────────────────────────────────────
 
 def run_start(thread_id: str, task: str) -> None:
-    """Print run header at startup."""
+    """Print run header and start the total-run timer."""
+    global _last_start, _run_start
+    _last_start = None
+    _run_start = time.monotonic()
     console.print()
     console.print(Rule(f"[bold]Run: {thread_id}[/bold]", style="dim"))
     console.print(f"[dim]Task:[/dim] {task}")
@@ -172,9 +227,18 @@ def run_start(thread_id: str, task: str) -> None:
 
 
 def run_complete(thread_id: str) -> None:
-    """Print run completion banner."""
+    """Print run completion banner with total elapsed time."""
+    global _run_start
+    time_str = ""
+    if _run_start is not None:
+        elapsed = time.monotonic() - _run_start
+        m, s = divmod(int(elapsed), 60)
+        time_str = f" ({m}m {s}s)" if m else f" ({s}s)"
     console.print()
-    console.print(Rule(f"[bold green]✅  {thread_id} — complete[/bold green]", style="green"))
+    console.print(Rule(
+        f"[bold green]✅  {thread_id} — complete{time_str}[/bold green]",
+        style="green",
+    ))
     console.print()
 
 
