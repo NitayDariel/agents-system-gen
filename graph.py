@@ -34,6 +34,7 @@ from langgraph.types import Command, interrupt
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from state import AgentSystemState
+import ui
 
 
 # ─────────────────────────────────────────────
@@ -85,7 +86,7 @@ def _run_agent_raw(agent_prompt: str, injection: str, model: Optional[str] = Non
     )
     if result.returncode != 0:
         raise RuntimeError(f"Agent call failed:\nSTDERR: {result.stderr}\nSTDOUT: {result.stdout}")
-    print(result.stdout.strip(), flush=True)
+    ui.console.out(result.stdout.strip())
 
 
 def _run_agent(agent_prompt: str, injection: str, model: Optional[str] = None) -> dict:
@@ -108,9 +109,9 @@ def _run_agent(agent_prompt: str, injection: str, model: Optional[str] = None) -
     )
 
     if result.returncode != 0:
-        print(f"\n[ERROR] returncode: {result.returncode}", flush=True)
+        ui.error(f"returncode: {result.returncode}")
         if result.stderr:
-            print(f"[ERROR] stderr: {result.stderr[:400]}", flush=True)
+            ui.error(f"stderr: {result.stderr[:400]}")
         raise RuntimeError(f"Agent call failed:\nSTDERR: {result.stderr}\nSTDOUT: {result.stdout}")
 
     output = result.stdout.strip()
@@ -134,7 +135,7 @@ def _run_agent(agent_prompt: str, injection: str, model: Optional[str] = None) -
         ) from e
 
     if VERBOSE:
-        print(f"\n{json.dumps(packet, indent=2)}\n", flush=True)
+        ui.packet_json(packet)
 
     return packet
 
@@ -184,8 +185,8 @@ def communicator_inbound(state: AgentSystemState) -> AgentSystemState:
     if resolved:
         original_input = state.get("human_input", "")
         task_str = f"{original_input} — clarification criterion: {resolved}"
-        print(f"\n📨 [Communicator] Clarification resolved — building packet (no LLM)", flush=True)
-        print(f"   ✓ {state.get('task_type', 'project_work')} — {task_str}", flush=True)
+        ui.agent_header("📨", "Communicator", detail="clarification resolved — no LLM")
+        ui.agent_result("complete", f"{state.get('task_type', 'project_work')} — {task_str}")
         return {
             "communicator_task": task_str,
             "task_type": state.get("task_type", "project_work"),
@@ -198,7 +199,7 @@ def communicator_inbound(state: AgentSystemState) -> AgentSystemState:
         }
 
     # ── Normal path: call LLM ─────────────────────────────────────────────
-    print(f"\n📨 [Communicator/{AGENT_MODELS['communicator']}] Parsing input...", flush=True)
+    ui.agent_header("📨", "Communicator", AGENT_MODELS["communicator"])
     prompt = _load_agent_prompt("communicator.md")
     injection = _build_injection(
         today=state.get("today"),
@@ -206,13 +207,13 @@ def communicator_inbound(state: AgentSystemState) -> AgentSystemState:
         human_input=state.get("human_input"),
         project_context=state.get("project_context", ""),
     )
-    packet = _run_agent(prompt, injection, AGENT_MODELS["communicator"])
-    print(f"   ✓ {packet.get('task_type', '?')} — {packet.get('task', '')}", flush=True)
+    with ui.spinner("Parsing input..."):
+        packet = _run_agent(prompt, injection, AGENT_MODELS["communicator"])
+    ui.agent_result(packet.get("task_type", "?"), packet.get("task", ""))
 
     # ── Early clarification: pause BEFORE expensive downstream calls ───────
     if packet.get("clarification_asked") and not packet.get("ready_to_proceed", True):
         question = packet.get("clarification_question", "Please clarify your request.")
-        print(f"\n❓ [Communicator] Clarification needed — pausing before Thinker...", flush=True)
         interrupt({"question": question, "stage": "clarification"})
         # Execution never continues past here on the first run (interrupt pauses it).
         # On resume, resolved_clarification is in state → the early-exit above handles it.
@@ -235,8 +236,8 @@ def communicator_inbound(state: AgentSystemState) -> AgentSystemState:
 def thinker(state: AgentSystemState) -> AgentSystemState:
     """Produce a reasoned plan. Applies reality anchor, inversion, base rate."""
     retry = state.get("thinker_retry_count", 0)
-    retry_tag = f" (retry {retry})" if retry > 0 else ""
-    print(f"\n🧠 [Thinker/{AGENT_MODELS['thinker']}] Planning{retry_tag}...", flush=True)
+    retry_tag = f"retry {retry}" if retry > 0 else ""
+    ui.agent_header("🧠", "Thinker", AGENT_MODELS["thinker"], retry_tag)
     prompt = _load_agent_prompt("thinker_v2-2.md")
 
     # Load TELOS only when required by Communicator
@@ -272,8 +273,9 @@ def thinker(state: AgentSystemState) -> AgentSystemState:
         telos=telos_content or None,
         prior_output=prior_output or None,
     )
-    packet = _run_agent(prompt, injection, AGENT_MODELS["thinker"])
-    print(f"   ✓ {packet.get('status', '?')} — {packet.get('summary', '')}", flush=True)
+    with ui.spinner("Planning..."):
+        packet = _run_agent(prompt, injection, AGENT_MODELS["thinker"])
+    ui.agent_result(packet.get("status", "?"), packet.get("summary", ""))
 
     plan = packet.get("plan", [])
 
@@ -314,14 +316,14 @@ def thinker(state: AgentSystemState) -> AgentSystemState:
         # Load first commission, queue the rest for sequential execution
         updates["research_commission"] = all_research_steps[0]["researcher_commission"]
         updates["pending_research"] = [s["researcher_commission"] for s in all_research_steps[1:]]
-        print(f"   📋 Research queue: {len(all_research_steps)} commission(s) to run", flush=True)
+        ui.info(f"📋 Research queue: {len(all_research_steps)} commission(s) to run")
 
     return updates
 
 
 def critic(state: AgentSystemState) -> AgentSystemState:
     """Adversarially review the Thinker's plan. Can reject or approve."""
-    print(f"\n⚖️  [Critic/{AGENT_MODELS['critic']}] Reviewing plan...", flush=True)
+    ui.agent_header("⚖️ ", "Critic", AGENT_MODELS["critic"])
     prompt = _load_agent_prompt("critic.md")
     injection = _build_injection(
         today=state.get("today"),
@@ -331,8 +333,9 @@ def critic(state: AgentSystemState) -> AgentSystemState:
         thinker_packet=json.dumps(state.get("thinker_packet", {})),
         thinker_log_ref=state.get("thinker_log_ref"),
     )
-    packet = _run_agent(prompt, injection, AGENT_MODELS["critic"])
-    print(f"   ✓ {packet.get('verdict', '?')} — {packet.get('summary', '')}", flush=True)
+    with ui.spinner("Reviewing plan..."):
+        packet = _run_agent(prompt, injection, AGENT_MODELS["critic"])
+    ui.agent_result(packet.get("verdict", "?"), packet.get("summary", ""))
 
     verdict = packet.get("verdict", "approved")
     # Increment here so route_after_critic reads the updated count (not pre-thinker count)
@@ -354,7 +357,7 @@ def researcher(state: AgentSystemState) -> AgentSystemState:
     """Execute a research commission. Routes back to the commissioning agent."""
     commission = state.get("research_commission", {})
     q = commission.get("question", "")
-    print(f"\n🔬 [Researcher/{AGENT_MODELS['researcher']}] Searching: {q}...", flush=True)
+    ui.agent_header("🔬", "Researcher", AGENT_MODELS["researcher"], q[:60] + ("…" if len(q) > 60 else ""))
     prompt = _load_agent_prompt("researcher.md")
     commission = state.get("research_commission", {})
 
@@ -367,9 +370,10 @@ def researcher(state: AgentSystemState) -> AgentSystemState:
         project_context=commission.get("context"),
         prior_output=None,
     )
-    packet = _run_agent(prompt, injection, AGENT_MODELS["researcher"])
+    with ui.spinner("Searching..."):
+        packet = _run_agent(prompt, injection, AGENT_MODELS["researcher"])
     n = len(packet.get("findings", []))
-    print(f"   ✓ {packet.get('status', '?')} — {n} finding(s). {packet.get('summary', '')}", flush=True)
+    ui.agent_result(packet.get("status", "?"), f"{n} finding(s). {packet.get('summary', '')}")
 
     # Accumulate findings across all commissions (don't overwrite)
     existing_findings = state.get("researcher_findings", [])
@@ -393,13 +397,13 @@ def researcher(state: AgentSystemState) -> AgentSystemState:
     }
     if has_more:
         updates["research_commission"] = next_commission
-        print(f"   🔁 {len(pending)} commission(s) remaining in queue", flush=True)
+        ui.info(f"🔁 {len(pending)} commission(s) remaining in queue")
     return updates
 
 
 def lead_engineer(state: AgentSystemState) -> AgentSystemState:
     """Decompose plan into tasks with DoD. Governs git. Handles QA failures."""
-    print("\n🔧 [Lead Engineer] Decomposing tasks...", flush=True)
+    ui.agent_header("🔧", "Lead Engineer", AGENT_MODELS.get("lead_engineer", ""))
     prompt = _load_agent_prompt("lead_engineer.md")
 
     # Critic verdict summary for injection
@@ -423,9 +427,10 @@ def lead_engineer(state: AgentSystemState) -> AgentSystemState:
         logs_directory=state.get("logs_directory"),
         prior_qa_failures=json.dumps(state.get("prior_qa_failures", [])),
     )
-    packet = _run_agent(prompt, injection, AGENT_MODELS["lead_engineer"])
+    with ui.spinner("Decomposing tasks..."):
+        packet = _run_agent(prompt, injection, AGENT_MODELS["lead_engineer"])
     n = len(packet.get("tasks", []))
-    print(f"   ✓ {packet.get('status', '?')} — {n} task(s) defined. {packet.get('summary', '')}", flush=True)
+    ui.agent_result(packet.get("status", "?"), f"{n} task(s) defined. {packet.get('summary', '')}")
 
     tasks = packet.get("tasks", [])
     return {
@@ -444,7 +449,7 @@ def developer(state: AgentSystemState) -> AgentSystemState:
     task = state.get("current_task", {})
     task_id = task.get("task_id", "?")
     title = task.get("title", "")[:50]
-    print(f"\n💻 [Developer] Implementing {task_id}: {title}...", flush=True)
+    ui.agent_header("💻", "Developer", AGENT_MODELS.get("developer", ""), f"{task_id}: {title}")
     prompt = _load_agent_prompt("developer.md")
 
     # Check if this is a clarification response from Lead Engineer
@@ -461,10 +466,9 @@ def developer(state: AgentSystemState) -> AgentSystemState:
         logs_directory=state.get("logs_directory"),
         prior_output=prior_output or None,
     )
-    packet = _run_agent(prompt, injection, AGENT_MODELS["developer"])
-    status = packet.get("status", "?")
-    icon = "✓" if status == "complete" else "⚠"
-    print(f"   {icon} {status} — {packet.get('summary', '')}", flush=True)
+    with ui.spinner(f"Implementing {task_id}..."):
+        packet = _run_agent(prompt, injection, AGENT_MODELS["developer"])
+    ui.agent_result(packet.get("status", "?"), packet.get("summary", ""))
 
     updates: AgentSystemState = {
         "agent_flow": state.get("agent_flow", []) + ["dev"],
@@ -484,7 +488,7 @@ def qa(state: AgentSystemState) -> AgentSystemState:
     """Run quality checks against the task DoD. May fail back to Lead Engineer."""
     task = state.get("current_task", {})
     task_id = task.get("task_id", "?")
-    print(f"\n🔍 [QA] Verifying {task_id}...", flush=True)
+    ui.agent_header("🔍", "QA", AGENT_MODELS.get("qa", ""), task_id)
     prompt = _load_agent_prompt("qa.md")
 
     injection = _build_injection(
@@ -496,11 +500,11 @@ def qa(state: AgentSystemState) -> AgentSystemState:
         logs_directory=state.get("logs_directory"),
         blocking_threshold=task.get("blocking_threshold", "p0_p1"),
     )
-    packet = _run_agent(prompt, injection, AGENT_MODELS["qa"])
+    with ui.spinner(f"Verifying {task_id}..."):
+        packet = _run_agent(prompt, injection, AGENT_MODELS["qa"])
     status = packet.get("status", "?")
     n_fail = len([f for f in packet.get("findings", []) if f.get("severity") in ("p0", "p1")])
-    icon = "✓" if status == "pass" else "✗"
-    print(f"   {icon} {status} — {n_fail} blocking finding(s). {packet.get('summary', '')}", flush=True)
+    ui.agent_result(status, f"{n_fail} blocking finding(s). {packet.get('summary', '')}")
 
     # Track per-task retry count
     task_id = task.get("task_id", "unknown")
@@ -524,7 +528,7 @@ def integration_agent(state: AgentSystemState) -> AgentSystemState:
     """Test module boundaries after a batch merge."""
     batch = state.get("integration_batch", {})
     batch_id = batch.get("batch_id", "?")
-    print(f"\n🔗 [Integration] Testing batch {batch_id}...", flush=True)
+    ui.agent_header("🔗", "Integration", AGENT_MODELS.get("integration_agent", ""), f"batch {batch_id}")
     prompt = _load_agent_prompt("integration_agent.md")
 
     # Gather task packets for all tasks in this batch
@@ -547,7 +551,7 @@ def integration_agent(state: AgentSystemState) -> AgentSystemState:
         project_context=state.get("project_context", ""),
     )
     packet = _run_agent(prompt, injection, AGENT_MODELS["integration_agent"])
-    print(f"   ✓ {packet.get('status', '?')} — {packet.get('summary', '')}", flush=True)
+    ui.agent_result(packet.get("status", "?"), packet.get("summary", ""))
 
     log_ref = packet.get("log_ref", "")
     return {
@@ -561,7 +565,7 @@ def integration_agent(state: AgentSystemState) -> AgentSystemState:
 
 def system_improvement_agent(state: AgentSystemState) -> AgentSystemState:
     """Weekly meta-audit. Reads all agent logs and produces improvement backlog."""
-    print("\n🔄 [SIA] Running system audit...", flush=True)
+    ui.agent_header("🔄", "SIA", AGENT_MODELS.get("system_improvement_agent", ""), state.get("sia_run_type", "scheduled"))
     prompt = _load_agent_prompt("system_improvement_agent.md")
     injection = _build_injection(
         today=state.get("today"),
@@ -573,10 +577,9 @@ def system_improvement_agent(state: AgentSystemState) -> AgentSystemState:
         prior_backlog=state.get("prior_backlog"),
         project_context=state.get("project_context", ""),
     )
-    packet = _run_agent(prompt, injection, AGENT_MODELS["system_improvement_agent"])
-    health = packet.get("system_health", "?")
-    icon = "✓" if health == "healthy" else "⚠"
-    print(f"   {icon} {health} — {packet.get('summary', '')}", flush=True)
+    with ui.spinner("SIA auditing system logs..."):
+        packet = _run_agent(prompt, injection, AGENT_MODELS["system_improvement_agent"])
+    ui.agent_result(packet.get("system_health", "?"), packet.get("summary", ""))
 
     return {
         "agent_flow": state.get("agent_flow", []) + ["sia"],
@@ -596,7 +599,7 @@ def human_checkpoint(state: AgentSystemState) -> AgentSystemState:
     After the human replies, the graph resumes with human_decision set.
     """
     stage = state.get("checkpoint_stage", "unknown")
-    print(f"\n⏸️  [Checkpoint] {stage} — awaiting human input...", flush=True)
+    ui.agent_header("⏸️", "Checkpoint", detail=stage)
     prompt = _load_agent_prompt("communicator.md")
     injection = _build_injection(
         today=state.get("today"),
@@ -625,7 +628,7 @@ def human_checkpoint(state: AgentSystemState) -> AgentSystemState:
 
 def communicator_outbound(state: AgentSystemState) -> AgentSystemState:
     """Format final output for the human and mark workflow complete."""
-    print("\n📤 [Communicator] Formatting output...", flush=True)
+    ui.agent_header("📤", "Communicator", AGENT_MODELS["communicator"], "outbound")
     prompt = _load_agent_prompt("communicator.md")
     # If this is a synthesis run, surface the artifact path explicitly
     artifact_path = state.get("thinker_packet", {}).get("artifact_path")
@@ -638,9 +641,8 @@ def communicator_outbound(state: AgentSystemState) -> AgentSystemState:
         project_context=state.get("project_context", ""),
     )
     _run_agent_raw(prompt, injection, AGENT_MODELS["communicator"])  # Prints human-readable text
-    print("\n✅ [System] Workflow complete.\n", flush=True)
     flow = state.get("agent_flow", []) + ["output"]
-    print(f"📊 Flow: {_format_agent_flow(flow)}\n", flush=True)
+    ui.flow_summary(flow)
     return {"completed": True, "agent_flow": flow}
 
 
@@ -670,7 +672,7 @@ def route_after_thinker(state: AgentSystemState) -> str:
     assigned_roles = [step.get("assigned_to") for step in plan if step.get("assigned_to")]
 
     # Debug: show plan breakdown so routing decisions are visible
-    print(f"\n[ROUTE] plan steps ({len(plan)}): {assigned_roles}", flush=True)
+    ui.info(f"[ROUTE] plan steps ({len(plan)}): {assigned_roles}")
 
     # Filter out self-referential "thinker" steps — they are synthesis placeholders,
     # not real agent assignments. Routing should be based on the OTHER agents in the plan.
@@ -769,11 +771,11 @@ def route_after_researcher(state: AgentSystemState) -> str:
     """Route Researcher output back to commissioning agent."""
     # Safety cap: prevent infinite research loops
     if state.get("researcher_iteration_count", 0) >= MAX_RESEARCHER_ITERATIONS:
-        print(f"\n⚠️  [Route] Researcher iteration cap hit — routing to communicator_outbound", flush=True)
+        ui.info("⚠  [Route] Researcher iteration cap hit — routing to communicator_outbound")
         return "communicator_outbound"
     # More commissions queued — loop back to run next one
     if state.get("researcher_has_more"):
-        print(f"\n[Route] More research commissions queued — continuing researcher loop", flush=True)
+        ui.info("[Route] More research commissions queued — continuing researcher loop")
         return "researcher"
     commissioner = state.get("research_commissioner", "lead_engineer")
     if commissioner == "thinker":
@@ -977,36 +979,31 @@ def _run_interrupt_loop(app, config: dict, thread_id: str) -> None:
                     clarification_interrupt = val
                     break
 
-        print("\n" + "─" * 52, flush=True)
-
         if clarification_interrupt:
-            print("❓  CLARIFICATION (before processing):", flush=True)
-            print(f"\n  {clarification_interrupt.get('question', '')}", flush=True)
-            print("\nYour answer:", flush=True)
+            ui.clarification_panel(clarification_interrupt.get("question", ""))
         elif checkpoint_type == "thinker_needs_clarification":
             thinker_pkt = state_vals.get("thinker_packet", {})
             blockers = thinker_pkt.get("blockers", [])
-            print("⏸️  THINKER NEEDS CLARIFICATION", flush=True)
-            if blockers:
-                print("", flush=True)
-                for b in blockers:
-                    print(f"  • {b}", flush=True)
-            print("\nAnswer the above (or 'proceed' to let the system assume):", flush=True)
+            ui.checkpoint_panel(
+                "Thinker needs clarification",
+                blockers=blockers,
+                prompt_text="Answer the above (or 'proceed' to let the system assume):",
+            )
         elif checkpoint_type == "synthesis_needs_clarification":
             thinker_pkt = state_vals.get("thinker_packet", {})
             blockers = thinker_pkt.get("blockers", [])
-            print("⏸️  SYNTHESIS — OPEN QUESTIONS:", flush=True)
-            if blockers:
-                print("", flush=True)
-                for b in blockers:
-                    print(f"  • {b}", flush=True)
-            print("\nAnswer the above (or 'proceed' to synthesize with best assumptions):", flush=True)
+            ui.checkpoint_panel(
+                "Synthesis — open questions",
+                blockers=blockers,
+                prompt_text="Answer the above (or 'proceed' to synthesize with best assumptions):",
+            )
         else:
-            print(f"⏸️  CHECKPOINT: {state_vals.get('checkpoint_stage', 'unknown')}", flush=True)
-            print("Options: proceed / pause / redirect", flush=True)
+            ui.checkpoint_panel(
+                state_vals.get("checkpoint_stage", "unknown"),
+                options=["proceed", "pause", "redirect"],
+            )
 
-        print("─" * 52, flush=True)
-        human_response = input("> ").strip() or "proceed"
+        human_response = ui.console.input("[dim]>[/dim] ").strip() or "proceed"
 
         if clarification_interrupt:
             # Resolve any letter shorthand (e.g. "a" → full option text) deterministically.
@@ -1020,7 +1017,7 @@ def _run_interrupt_loop(app, config: dict, thread_id: str) -> None:
 
         app.invoke(Command(resume=human_response), config=config)
 
-    print(f"\n✅ [Run: {thread_id}] Workflow complete.\n", flush=True)
+    ui.run_complete(thread_id)
 
 
 def _cmd_list(checkpointer) -> None:
@@ -1196,14 +1193,14 @@ if __name__ == "__main__":
                         "decision_journal": "./improvement/decision_journal.json",
                         "prior_backlog": "./improvement/backlog.json",
                     }
-                    print(f"\n * [Follow-up from: {thread_id}] New run: {follow_id}\n", flush=True)
+                    ui.run_start(follow_id, f"[Follow-up from: {thread_id}] {args.task}")
                     follow_app = build_app(checkpointer)
                     follow_app.invoke(follow_state, config=follow_config)
                     _run_interrupt_loop(follow_app, follow_config, follow_id)
                 else:
                     print(f"Run '{thread_id}' is already complete. Pass a task to start a follow-up run.")
                 sys.exit(0)
-            print(f"\n * Resuming run: {thread_id}\n", flush=True)
+            ui.run_start(thread_id, f"[Resume] {args.task or '...'}")
             if args.task:
                 app.invoke(Command(resume=args.task), config=config)
             _run_interrupt_loop(app, config, thread_id)
@@ -1241,7 +1238,7 @@ if __name__ == "__main__":
             "prior_backlog": "./improvement/backlog.json",
         }
 
-        print(f"\n * [Run: {thread_id}] Starting: {args.task}...\n", flush=True)
+        ui.run_start(thread_id, args.task)
         app = build_app(checkpointer)
         app.invoke(initial_state, config=config)
         _run_interrupt_loop(app, config, thread_id)
