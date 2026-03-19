@@ -148,7 +148,8 @@ def flow_summary(flow: list) -> None:
             count += 1
         color = AGENT_COLORS.get(label, "white")
         tag = f"{label}×{count}" if count > 1 else label
-        collapsed.append(f"[{color}][{tag}][/{color}]")
+        # Escape brackets so Rich doesn't interpret [comm] as a markup tag
+        collapsed.append(f"[{color}]\\[{tag}][/{color}]")
         i += count
 
     chain = " [dim]→[/dim] ".join(collapsed)
