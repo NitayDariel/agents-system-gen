@@ -2,6 +2,9 @@
 .env
 .env.*
 
+# Runtime checkpoint state (local only)
+checkpoint.db
+
 # Agent run logs (generated output, not source)
 logs/
 

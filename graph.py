@@ -31,7 +31,7 @@ from typing import Optional
 
 from langgraph.graph import StateGraph, END
 from langgraph.types import Command, interrupt
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 from state import AgentSystemState
 
@@ -44,7 +44,7 @@ AGENTS_DIR = Path(__file__).parent
 TELOS_PATH = Path.home() / ".claude/skills/PAI/USER/TELOS/goals.md"
 MAX_THINKER_RETRIES = 3
 MAX_QA_RETRIES = 2
-MAX_RESEARCHER_ITERATIONS = 3
+MAX_RESEARCHER_ITERATIONS = 12  # Each queue commission counts as 1 iteration
 VERBOSE = True  # Set False to suppress full packet output
 
 AGENT_MODELS = {
@@ -148,12 +148,56 @@ def _build_injection(**kwargs) -> str:
     return "\n".join(lines)
 
 
+def _format_agent_flow(flow: list[str]) -> str:
+    """Collapse consecutive duplicates and return a compact chain string.
+
+    e.g. ["comm","clarify","thinker","researcher","researcher","researcher","output"]
+    →    "[comm] → [clarify] → [thinker] → [researcher×3] → [output]"
+    """
+    if not flow:
+        return "(empty)"
+    collapsed = []
+    i = 0
+    while i < len(flow):
+        label = flow[i]
+        count = 1
+        while i + count < len(flow) and flow[i + count] == label:
+            count += 1
+        collapsed.append(f"{label}×{count}" if count > 1 else label)
+        i += count
+    return " → ".join(f"[{s}]" for s in collapsed)
+
+
 # ─────────────────────────────────────────────
 # Nodes
 # ─────────────────────────────────────────────
 
 def communicator_inbound(state: AgentSystemState) -> AgentSystemState:
     """Parse and classify human input. Produce structured task packet."""
+
+    # ── Deterministic resume path: skip LLM entirely ──────────────────────
+    # _run_interrupt_loop writes resolved_clarification to state via app.update_state()
+    # before calling Command(resume=...). On the resume run, LangGraph re-executes
+    # this function from the top — we detect the resolved answer here and return
+    # immediately without any LLM call, eliminating the double-ask bug entirely.
+    resolved = state.get("resolved_clarification")
+    if resolved:
+        original_input = state.get("human_input", "")
+        task_str = f"{original_input} — clarification criterion: {resolved}"
+        print(f"\n📨 [Communicator] Clarification resolved — building packet (no LLM)", flush=True)
+        print(f"   ✓ {state.get('task_type', 'project_work')} — {task_str}", flush=True)
+        return {
+            "communicator_task": task_str,
+            "task_type": state.get("task_type", "project_work"),
+            "telos_required": state.get("telos_required", False),
+            "clarification_asked": False,
+            "clarification_question": None,
+            "ready_to_proceed": True,
+            "resolved_clarification": None,  # clear after use
+            "agent_flow": state.get("agent_flow", []) + ["clarify"],
+        }
+
+    # ── Normal path: call LLM ─────────────────────────────────────────────
     print(f"\n📨 [Communicator/{AGENT_MODELS['communicator']}] Parsing input...", flush=True)
     prompt = _load_agent_prompt("communicator.md")
     injection = _build_injection(
@@ -165,6 +209,14 @@ def communicator_inbound(state: AgentSystemState) -> AgentSystemState:
     packet = _run_agent(prompt, injection, AGENT_MODELS["communicator"])
     print(f"   ✓ {packet.get('task_type', '?')} — {packet.get('task', '')}", flush=True)
 
+    # ── Early clarification: pause BEFORE expensive downstream calls ───────
+    if packet.get("clarification_asked") and not packet.get("ready_to_proceed", True):
+        question = packet.get("clarification_question", "Please clarify your request.")
+        print(f"\n❓ [Communicator] Clarification needed — pausing before Thinker...", flush=True)
+        interrupt({"question": question, "stage": "clarification"})
+        # Execution never continues past here on the first run (interrupt pauses it).
+        # On resume, resolved_clarification is in state → the early-exit above handles it.
+
     updates: AgentSystemState = {
         "communicator_task": packet.get("task", ""),
         "task_type": packet.get("task_type", "project_work"),
@@ -172,8 +224,8 @@ def communicator_inbound(state: AgentSystemState) -> AgentSystemState:
         "clarification_asked": packet.get("clarification_asked", False),
         "clarification_question": packet.get("clarification_question"),
         "ready_to_proceed": packet.get("ready_to_proceed", True),
+        "agent_flow": state.get("agent_flow", []) + ["comm"],
     }
-    # If telos_required, capture the source path from packet or use default
     if packet.get("telos_required"):
         updates["telos_source_path"] = packet.get("telos_source_path", str(TELOS_PATH))
 
@@ -196,7 +248,7 @@ def thinker(state: AgentSystemState) -> AgentSystemState:
     # PRIOR_OUTPUT: inject human clarification, researcher findings, or Critic summary
     # in priority order.
     prior_output = ""
-    if state.get("checkpoint_type") == "thinker_needs_clarification" and state.get("human_decision"):
+    if state.get("checkpoint_type") in ("thinker_needs_clarification", "synthesis_needs_clarification") and state.get("human_decision"):
         # Retry after human answered clarification questions
         prior_output = (
             f"HUMAN CLARIFICATION RESPONSE: {state.get('human_decision')}\n"
@@ -225,13 +277,14 @@ def thinker(state: AgentSystemState) -> AgentSystemState:
 
     plan = packet.get("plan", [])
 
-    # If routing will go directly to researcher, pre-load the first commission
-    first_research_step = next(
-        (s for s in plan if s.get("assigned_to") == "researcher" and s.get("researcher_commission")),
-        None,
-    )
+    # Extract ALL researcher commissions from plan, load as a queue
+    all_research_steps = [
+        s for s in plan
+        if s.get("assigned_to") == "researcher" and s.get("researcher_commission")
+    ]
 
     updates: AgentSystemState = {
+        "agent_flow": state.get("agent_flow", []) + ["thinker"],
         "thinker_status": packet.get("status", "complete"),
         "thinker_packet": packet,
         "thinker_real_question": packet.get("real_question", ""),
@@ -243,13 +296,25 @@ def thinker(state: AgentSystemState) -> AgentSystemState:
         # Clear any previous checkpoint/clarification state on each Thinker run
         "checkpoint_type": None,
         "human_decision": None,
+        # Reset researcher accumulation for new planning cycle
+        "researcher_findings": [],
+        "researcher_iteration_count": 0,
+        "researcher_has_more": False,
     }
     if packet.get("status") == "needs_human_input":
         updates["checkpoint_type"] = "thinker_needs_clarification"
         updates["checkpoint_stage"] = "thinker_needs_clarification"
         updates["checkpoint_required"] = True
-    if first_research_step:
-        updates["research_commission"] = first_research_step["researcher_commission"]
+    if packet.get("status") == "synthesized" and packet.get("blockers"):
+        # Synthesis is incomplete — needs human clarification before finishing
+        updates["checkpoint_type"] = "synthesis_needs_clarification"
+        updates["checkpoint_stage"] = "synthesis_needs_clarification"
+        updates["checkpoint_required"] = True
+    if all_research_steps:
+        # Load first commission, queue the rest for sequential execution
+        updates["research_commission"] = all_research_steps[0]["researcher_commission"]
+        updates["pending_research"] = [s["researcher_commission"] for s in all_research_steps[1:]]
+        print(f"   📋 Research queue: {len(all_research_steps)} commission(s) to run", flush=True)
 
     return updates
 
@@ -274,6 +339,7 @@ def critic(state: AgentSystemState) -> AgentSystemState:
     new_retry_count = state.get("thinker_retry_count", 0) + (1 if verdict in ("revise", "reject") else 0)
 
     return {
+        "agent_flow": state.get("agent_flow", []) + ["critic"],
         "critic_status": verdict,
         "critic_packet": packet,
         "critic_verdict": verdict,
@@ -305,13 +371,30 @@ def researcher(state: AgentSystemState) -> AgentSystemState:
     n = len(packet.get("findings", []))
     print(f"   ✓ {packet.get('status', '?')} — {n} finding(s). {packet.get('summary', '')}", flush=True)
 
-    return {
+    # Accumulate findings across all commissions (don't overwrite)
+    existing_findings = state.get("researcher_findings", [])
+    new_findings = packet.get("findings", packet.get("key_findings", []))
+    accumulated = existing_findings + new_findings
+
+    # Pop next commission from queue if available
+    pending = list(state.get("pending_research", []))
+    has_more = bool(pending)
+    next_commission = pending.pop(0) if has_more else None
+
+    updates: AgentSystemState = {
+        "agent_flow": state.get("agent_flow", []) + ["researcher"],
         "researcher_status": packet.get("status", "complete"),
         "researcher_packet": packet,
-        "researcher_findings": packet.get("findings", packet.get("key_findings", [])),
+        "researcher_findings": accumulated,
         "researcher_log_ref": packet.get("log_ref", ""),
         "researcher_iteration_count": state.get("researcher_iteration_count", 0) + 1,
+        "pending_research": pending,
+        "researcher_has_more": has_more,
     }
+    if has_more:
+        updates["research_commission"] = next_commission
+        print(f"   🔁 {len(pending)} commission(s) remaining in queue", flush=True)
+    return updates
 
 
 def lead_engineer(state: AgentSystemState) -> AgentSystemState:
@@ -346,6 +429,7 @@ def lead_engineer(state: AgentSystemState) -> AgentSystemState:
 
     tasks = packet.get("tasks", [])
     return {
+        "agent_flow": state.get("agent_flow", []) + ["lead_eng"],
         "lead_engineer_status": packet.get("status", "complete"),
         "lead_engineer_packet": packet,
         "task_queue": tasks,
@@ -383,6 +467,7 @@ def developer(state: AgentSystemState) -> AgentSystemState:
     print(f"   {icon} {status} — {packet.get('summary', '')}", flush=True)
 
     updates: AgentSystemState = {
+        "agent_flow": state.get("agent_flow", []) + ["dev"],
         "developer_status": packet.get("status", "complete"),
         "developer_packet": packet,
         "developer_log_ref": packet.get("log_ref", ""),
@@ -425,6 +510,7 @@ def qa(state: AgentSystemState) -> AgentSystemState:
         qa_retry_count[task_id] = qa_retry_count.get(task_id, 0) + 1
 
     return {
+        "agent_flow": state.get("agent_flow", []) + ["qa"],
         "qa_status": qa_status,
         "qa_packet": packet,
         "qa_findings": packet.get("findings", []),
@@ -465,6 +551,7 @@ def integration_agent(state: AgentSystemState) -> AgentSystemState:
 
     log_ref = packet.get("log_ref", "")
     return {
+        "agent_flow": state.get("agent_flow", []) + ["integration"],
         "integration_status": packet.get("status", "pass"),
         "integration_packet": packet,
         "integration_log_ref": log_ref,
@@ -492,6 +579,7 @@ def system_improvement_agent(state: AgentSystemState) -> AgentSystemState:
     print(f"   {icon} {health} — {packet.get('summary', '')}", flush=True)
 
     return {
+        "agent_flow": state.get("agent_flow", []) + ["sia"],
         "sia_status": packet.get("status", "complete"),
         "sia_packet": packet,
         "sia_system_health": packet.get("system_health", "healthy"),
@@ -529,7 +617,10 @@ def human_checkpoint(state: AgentSystemState) -> AgentSystemState:
         }
     )
 
-    return {"human_decision": human_decision}
+    return {
+        "human_decision": human_decision,
+        "agent_flow": state.get("agent_flow", []) + ["checkpoint"],
+    }
 
 
 def communicator_outbound(state: AgentSystemState) -> AgentSystemState:
@@ -548,7 +639,9 @@ def communicator_outbound(state: AgentSystemState) -> AgentSystemState:
     )
     _run_agent_raw(prompt, injection, AGENT_MODELS["communicator"])  # Prints human-readable text
     print("\n✅ [System] Workflow complete.\n", flush=True)
-    return {"completed": True}
+    flow = state.get("agent_flow", []) + ["output"]
+    print(f"📊 Flow: {_format_agent_flow(flow)}\n", flush=True)
+    return {"completed": True, "agent_flow": flow}
 
 
 # ─────────────────────────────────────────────
@@ -556,8 +649,8 @@ def communicator_outbound(state: AgentSystemState) -> AgentSystemState:
 # ─────────────────────────────────────────────
 
 def route_after_communicator_inbound(state: AgentSystemState) -> str:
-    if not state.get("ready_to_proceed", True):
-        return END  # Wait for human clarification response
+    # Clarification is now handled inside communicator_inbound via interrupt().
+    # By the time we reach this router, ready_to_proceed is always True.
     return "thinker"
 
 
@@ -567,6 +660,9 @@ def route_after_thinker(state: AgentSystemState) -> str:
     if state.get("thinker_status") == "blocked":
         return "communicator_outbound"
     if state.get("thinker_status") == "synthesized":
+        # If synthesis has unresolved blockers, pause for human clarification
+        if state.get("thinker_packet", {}).get("blockers"):
+            return "human_checkpoint"
         return "communicator_outbound"
 
     plan = state.get("thinker_plan", [])
@@ -634,6 +730,9 @@ def route_after_checkpoint(state: AgentSystemState) -> str:
     if checkpoint_type == "thinker_needs_clarification":
         return "thinker"  # re-run Thinker with human's clarification in prior_output
 
+    if checkpoint_type == "synthesis_needs_clarification":
+        return "thinker"  # re-run Thinker (synthesis mode) with human's answers
+
     if checkpoint_type == "thinker_plan_review":
         return "lead_engineer"
     if checkpoint_type == "critic_verdict_review":
@@ -672,6 +771,10 @@ def route_after_researcher(state: AgentSystemState) -> str:
     if state.get("researcher_iteration_count", 0) >= MAX_RESEARCHER_ITERATIONS:
         print(f"\n⚠️  [Route] Researcher iteration cap hit — routing to communicator_outbound", flush=True)
         return "communicator_outbound"
+    # More commissions queued — loop back to run next one
+    if state.get("researcher_has_more"):
+        print(f"\n[Route] More research commissions queued — continuing researcher loop", flush=True)
+        return "researcher"
     commissioner = state.get("research_commissioner", "lead_engineer")
     if commissioner == "thinker":
         return "thinker"
@@ -791,73 +894,354 @@ def build_graph() -> StateGraph:
     return g
 
 
-# Compile with MemorySaver — required for interrupt() to work inside nodes
-graph = build_graph()
-app = graph.compile(checkpointer=MemorySaver())
+CHECKPOINT_DB = str(AGENTS_DIR / "checkpoint.db")
+
+
+def build_app(checkpointer):
+    """Compile the graph with a given checkpointer. Called at runtime, not import time."""
+    return build_graph().compile(checkpointer=checkpointer)
 
 
 # ─────────────────────────────────────────────
 # Entry point for direct invocation
 # ─────────────────────────────────────────────
 
-if __name__ == "__main__":
-    import sys
-    import datetime
+def _resolve_option_letters(human_input: str, question_text: str) -> str:
+    """
+    If the human replied with letter(s) like 'c', 'a & d', 'b, c', etc.,
+    look up each letter in the option list from `question_text` and return
+    the full resolved text. This makes resume values deterministic — the LLM
+    never needs to re-interpret shorthand.
 
-    human_message = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else input("Task: ")
+    If the input is free text (not a letter pattern), return it unchanged.
+    """
+    import re
 
-    initial_state: AgentSystemState = {
-        "today": datetime.date.today().isoformat(),
-        "human_input": human_message,
-        "project_context": "",
-        "thinker_retry_count": 0,
-        "qa_retry_count": {},
-        "pending_research": [],
-        "prior_qa_failures": [],
-        "completed": False,
-        "logs_directory": "./logs",
-        "progress_file": "./project/progress.md",
-        "adl_file": "./project/adr_log.md",
-        "tech_stack_file": "./project/tech_stack.md",
-        "sources_file": str(AGENTS_DIR / "sources.yaml"),
-        "decision_journal": "./improvement/decision_journal.json",
-        "prior_backlog": "./improvement/backlog.json",
-    }
+    # Detect if the whole response is letter-based: single letters separated by
+    # spaces, commas, &, 'and', or 'or'. e.g. "c", "a & d", "b, c", "a and b"
+    letter_pattern = re.compile(
+        r"^(?:[a-zA-Z](?:\s*(?:,|&|\band\b|\bor\b)\s*[a-zA-Z])*)\s*$",
+        re.IGNORECASE,
+    )
+    if not letter_pattern.match(human_input.strip()):
+        return human_input  # free-text answer — pass through unchanged
 
-    config = {"configurable": {"thread_id": "main"}}
-    print(f"\n\n * Starting agent system with: {human_message}...\n\n")
+    # Extract options from the question text: patterns like "(a) text" or "a) text"
+    options = {}
+    for match in re.finditer(r"\(([a-zA-Z])\)\s*([^,()\n]+?)(?=\s*[,(]|\s*—|\s*$)", question_text):
+        letter = match.group(1).lower()
+        text = match.group(2).strip().rstrip(" —,")
+        if text:
+            options[letter] = text
 
-    app.invoke(initial_state, config=config)
+    if not options:
+        return human_input  # couldn't parse options — pass through unchanged
 
-    # Interrupt loop — runs until graph reaches END or user stops it
+    # Extract individual STANDALONE letters the human chose.
+    # Split on whitespace/commas/& and keep only single-char tokens (skip "and", "or", etc.)
+    tokens = re.split(r"[\s,&]+", human_input.strip())
+    chosen_letters = [t.lower() for t in tokens if len(t) == 1 and t.isalpha()]
+    resolved = []
+    unresolved = []
+    for letter in chosen_letters:
+        if letter in options:
+            resolved.append(options[letter])
+        else:
+            unresolved.append(letter)
+
+    if not resolved:
+        return human_input  # no matches — pass through unchanged
+
+    result = " AND ".join(resolved)
+    if unresolved:
+        result += f" (also mentioned: {', '.join(unresolved)})"
+    return result
+
+
+def _run_interrupt_loop(app, config: dict, thread_id: str) -> None:
+    """Handle the interactive checkpoint loop until the graph reaches END."""
     while True:
         snapshot = app.get_state(config)
         if not snapshot.next:
-            # Graph reached END naturally
             break
 
-        # Graph is paused at a checkpoint — get human input and resume
         state_vals = snapshot.values
         checkpoint_type = state_vals.get("checkpoint_type", "")
 
+        # Check if this pause is a communicator clarification (early, pre-Thinker)
+        clarification_interrupt = None
+        for task in snapshot.tasks:
+            for irpt in getattr(task, "interrupts", []):
+                val = getattr(irpt, "value", None)
+                if isinstance(val, dict) and val.get("stage") == "clarification":
+                    clarification_interrupt = val
+                    break
+
         print("\n" + "─" * 52, flush=True)
 
-        if checkpoint_type == "thinker_needs_clarification":
-            # Show thinker's clarification questions directly
+        if clarification_interrupt:
+            print("❓  CLARIFICATION (before processing):", flush=True)
+            print(f"\n  {clarification_interrupt.get('question', '')}", flush=True)
+            print("\nYour answer:", flush=True)
+        elif checkpoint_type == "thinker_needs_clarification":
             thinker_pkt = state_vals.get("thinker_packet", {})
             blockers = thinker_pkt.get("blockers", [])
-            print("⏸️  CLARIFICATION NEEDED", flush=True)
+            print("⏸️  THINKER NEEDS CLARIFICATION", flush=True)
             if blockers:
                 print("", flush=True)
                 for b in blockers:
                     print(f"  • {b}", flush=True)
-            print("\nAnswer the above (or type 'proceed' to let the system assume):", flush=True)
+            print("\nAnswer the above (or 'proceed' to let the system assume):", flush=True)
+        elif checkpoint_type == "synthesis_needs_clarification":
+            thinker_pkt = state_vals.get("thinker_packet", {})
+            blockers = thinker_pkt.get("blockers", [])
+            print("⏸️  SYNTHESIS — OPEN QUESTIONS:", flush=True)
+            if blockers:
+                print("", flush=True)
+                for b in blockers:
+                    print(f"  • {b}", flush=True)
+            print("\nAnswer the above (or 'proceed' to synthesize with best assumptions):", flush=True)
         else:
             print(f"⏸️  CHECKPOINT: {state_vals.get('checkpoint_stage', 'unknown')}", flush=True)
             print("Options: proceed / pause / redirect", flush=True)
 
         print("─" * 52, flush=True)
         human_response = input("> ").strip() or "proceed"
+
+        if clarification_interrupt:
+            # Resolve any letter shorthand (e.g. "a" → full option text) deterministically.
+            human_response = _resolve_option_letters(
+                human_response,
+                clarification_interrupt.get("question", ""),
+            )
+            # Write resolved answer to state NOW — communicator_inbound reads this on
+            # resume and skips the LLM entirely (deterministic, zero second LLM call).
+            app.update_state(config, {"resolved_clarification": human_response})
+
         app.invoke(Command(resume=human_response), config=config)
 
-    print("\n✅ Workflow complete.\n", flush=True)
+    print(f"\n✅ [Run: {thread_id}] Workflow complete.\n", flush=True)
+
+
+def _cmd_list(checkpointer) -> None:
+    """Print all runs stored in the checkpoint DB with their status."""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(CHECKPOINT_DB)
+        rows = conn.execute(
+            "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
+        ).fetchall()
+        conn.close()
+    except Exception:
+        print("No runs found (checkpoint.db doesn't exist yet).")
+        return
+
+    if not rows:
+        print("No runs found.")
+        return
+
+    app = build_app(checkpointer)
+    print(f"\n{'ID':<20} {'Status':<12} {'Waiting on'}", flush=True)
+    print("─" * 52, flush=True)
+    for (tid,) in rows:
+        try:
+            snap = app.get_state({"configurable": {"thread_id": tid}})
+            if not snap.values:
+                status, waiting = "empty", ""
+            elif snap.next:
+                status = "⏸  paused"
+                waiting = snap.values.get("checkpoint_stage", snap.values.get("checkpoint_type", ""))
+            else:
+                status = "✅ complete"
+                waiting = ""
+        except Exception:
+            status, waiting = "unknown", ""
+        print(f"{tid:<20} {status:<12} {waiting}", flush=True)
+    print("", flush=True)
+
+
+_AUTO_ID_WORDS = [
+    "fox", "owl", "elk", "hawk", "wolf", "bear", "crow", "lynx", "swan",
+    "wren", "crane", "dove", "eagle", "finch", "heron", "lark", "moose",
+    "rook", "stork", "viper", "bison", "cobra", "dingo", "ember", "flint",
+    "grove", "inlet", "kelp", "lotus", "maple", "north", "orbit", "prism",
+    "quartz", "ridge", "solar", "thorn", "umbra", "vault", "whirl",
+]
+
+
+def _thread_exists(thread_id: str) -> bool:
+    """Return True if thread_id has any checkpoint data in the DB."""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(CHECKPOINT_DB)
+        row = conn.execute(
+            "SELECT 1 FROM checkpoints WHERE thread_id = ? LIMIT 1", (thread_id,)
+        ).fetchone()
+        conn.close()
+        return row is not None
+    except Exception:
+        return False
+
+
+def _generate_auto_id() -> str:
+    """Pick a random word-hex ID that doesn't already exist in the DB."""
+    import random
+    hex_chars = "0123456789abcdef"
+    for _ in range(100):  # give up after 100 tries (640 combos, very unlikely to exhaust)
+        word = random.choice(_AUTO_ID_WORDS)
+        suffix = random.choice(hex_chars)
+        candidate = f"{word}-{suffix}"
+        if not _thread_exists(candidate):
+            return candidate
+    # Fallback: plain uuid if somehow all slots taken
+    import uuid
+    return f"run-{uuid.uuid4().hex[:8]}"
+
+
+def _cmd_end(thread_id: str) -> None:
+    """Delete all checkpoints for a specific run (with confirmation)."""
+    import sqlite3
+    confirm = input(f"Delete run '{thread_id}'? This cannot be undone. [y/N]: ").strip().lower()
+    if confirm != "y":
+        print("Cancelled.", flush=True)
+        return
+    try:
+        conn = sqlite3.connect(CHECKPOINT_DB)
+        conn.execute("DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,))
+        conn.execute("DELETE FROM writes WHERE thread_id = ?", (thread_id,))
+        conn.commit()
+        conn.close()
+        print(f"Run '{thread_id}' deleted.", flush=True)
+    except Exception as e:
+        print(f"Could not delete run '{thread_id}': {e}", flush=True)
+
+
+def _cmd_end_all() -> None:
+    """Delete all checkpoint data (with confirmation)."""
+    import sqlite3
+    confirm = input("Delete ALL runs? This cannot be undone. [y/N]: ").strip().lower()
+    if confirm != "y":
+        print("Cancelled.", flush=True)
+        return
+    try:
+        conn = sqlite3.connect(CHECKPOINT_DB)
+        conn.execute("DELETE FROM checkpoints")
+        conn.execute("DELETE FROM writes")
+        conn.commit()
+        conn.close()
+        print("All runs deleted.", flush=True)
+    except Exception as e:
+        print(f"Could not clear checkpoint DB: {e}", flush=True)
+
+
+if __name__ == "__main__":
+    import sys
+    import argparse
+    import datetime
+
+    parser = argparse.ArgumentParser(description="Agent system orchestrator")
+    parser.add_argument("task", nargs="?", help="Task description (fresh run) or answer (resume)")
+    parser.add_argument("-n", "--name",    metavar="NAME",   help="Name this run (no spaces; must be unique)")
+    parser.add_argument("-r", "--resume",  metavar="NAME",   help="Resume a paused run by name")
+    parser.add_argument(      "--list",    action="store_true", help="List all runs and their status")
+    parser.add_argument(      "--end",     metavar="NAME",   help="Delete a specific run's checkpoint data")
+    parser.add_argument(      "--end-all", action="store_true", help="Delete all checkpoint data")
+    args = parser.parse_args()
+
+    with SqliteSaver.from_conn_string(CHECKPOINT_DB) as checkpointer:
+
+        # ── --list ──────────────────────────────────────────────
+        if args.list:
+            _cmd_list(checkpointer)
+            sys.exit(0)
+
+        # ── --end / --end-all ────────────────────────────────────
+        if args.end:
+            _cmd_end(args.end)
+            sys.exit(0)
+        if args.end_all:
+            _cmd_end_all()
+            sys.exit(0)
+
+        # ── --resume ─────────────────────────────────────────────
+        if args.resume:
+            thread_id = args.resume
+            config = {"configurable": {"thread_id": thread_id}}
+            app = build_app(checkpointer)
+            snap = app.get_state(config)
+            if not snap.values:
+                print(f"Run '{thread_id}' not found. Use --list to see available runs.")
+                sys.exit(1)
+            if not snap.next:
+                if args.task:
+                    # Follow-up: start a new run with previous synthesis as project_context
+                    prev_synthesis = snap.values.get("thinker_packet", {})
+                    prev_summary = prev_synthesis.get("synthesis", prev_synthesis.get("real_question", ""))
+                    follow_id = _generate_auto_id()
+                    follow_config = {"configurable": {"thread_id": follow_id}}
+                    follow_state: AgentSystemState = {
+                        "today": datetime.date.today().isoformat(),
+                        "human_input": args.task,
+                        "project_context": prev_summary,
+                        "thinker_retry_count": 0,
+                        "qa_retry_count": {},
+                        "pending_research": [],
+                        "prior_qa_failures": [],
+                        "completed": False,
+                        "logs_directory": "./logs",
+                        "progress_file": "./project/progress.md",
+                        "adl_file": "./project/adr_log.md",
+                        "tech_stack_file": "./project/tech_stack.md",
+                        "sources_file": str(AGENTS_DIR / "sources.yaml"),
+                        "decision_journal": "./improvement/decision_journal.json",
+                        "prior_backlog": "./improvement/backlog.json",
+                    }
+                    print(f"\n * [Follow-up from: {thread_id}] New run: {follow_id}\n", flush=True)
+                    follow_app = build_app(checkpointer)
+                    follow_app.invoke(follow_state, config=follow_config)
+                    _run_interrupt_loop(follow_app, follow_config, follow_id)
+                else:
+                    print(f"Run '{thread_id}' is already complete. Pass a task to start a follow-up run.")
+                sys.exit(0)
+            print(f"\n * Resuming run: {thread_id}\n", flush=True)
+            if args.task:
+                app.invoke(Command(resume=args.task), config=config)
+            _run_interrupt_loop(app, config, thread_id)
+            sys.exit(0)
+
+        # ── Fresh start ──────────────────────────────────────────
+        if not args.task:
+            args.task = input("Task: ").strip()
+
+        if args.name:
+            if _thread_exists(args.name):
+                print(f"Run '{args.name}' already exists. Use -r {args.name} to resume it, or choose a different name.")
+                sys.exit(1)
+            thread_id = args.name
+        else:
+            thread_id = _generate_auto_id()
+
+        config = {"configurable": {"thread_id": thread_id}}
+
+        initial_state: AgentSystemState = {
+            "today": datetime.date.today().isoformat(),
+            "human_input": args.task,
+            "project_context": "",
+            "thinker_retry_count": 0,
+            "qa_retry_count": {},
+            "pending_research": [],
+            "prior_qa_failures": [],
+            "completed": False,
+            "logs_directory": "./logs",
+            "progress_file": "./project/progress.md",
+            "adl_file": "./project/adr_log.md",
+            "tech_stack_file": "./project/tech_stack.md",
+            "sources_file": str(AGENTS_DIR / "sources.yaml"),
+            "decision_journal": "./improvement/decision_journal.json",
+            "prior_backlog": "./improvement/backlog.json",
+        }
+
+        print(f"\n * [Run: {thread_id}] Starting: {args.task}...\n", flush=True)
+        app = build_app(checkpointer)
+        app.invoke(initial_state, config=config)
+        _run_interrupt_loop(app, config, thread_id)

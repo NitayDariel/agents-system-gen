@@ -18,6 +18,7 @@ TaskType = Literal["project_work", "goal_setting", "project_definition", "strate
 CheckpointType = Literal[
     "thinker_plan_review",
     "thinker_needs_clarification",
+    "synthesis_needs_clarification",
     "critic_verdict_review",
     "qa_pass_merge_approval",
     "integration_failure_review",
@@ -74,6 +75,7 @@ class AgentSystemState(TypedDict, total=False):
     researcher_log_ref: str
     pending_research: list[dict[str, Any]]  # Queue of non-blocking research commissions
     researcher_iteration_count: int         # Safety cap tracker (max MAX_RESEARCHER_ITERATIONS)
+    researcher_has_more: bool               # True when pending_research still has commissions to run
 
     # ── Lead Engineer ─────────────────────────────────────────────────────────
     lead_engineer_status: AgentStatus
@@ -121,6 +123,12 @@ class AgentSystemState(TypedDict, total=False):
     checkpoint_type: CheckpointType     # Determines which node handles post-approval routing
     checkpoint_stage: str               # Label shown in Communicator checkpoint message
     human_decision: Literal["proceed", "pause", "redirect"]  # Human's response
+
+    # ── Clarification Resume ──────────────────────────────────────────────────
+    resolved_clarification: Optional[str]   # Set by _run_interrupt_loop before resume; read by communicator_inbound to skip LLM
+
+    # ── Agent Flow Tracking ───────────────────────────────────────────────────
+    agent_flow: list[str]               # Ordered list of agent labels appended by each node at runtime
 
     # ── Routing / Control ─────────────────────────────────────────────────────
     next_agent: str                     # Explicit override for orchestrator routing (rarely used)
