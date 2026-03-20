@@ -63,6 +63,17 @@ AGENT_MODELS = {
     "integration_agent":         "claude-haiku-4-5-20251001",
 }
 
+# Fast/efficient mode — override all agents with Haiku when --fast is set
+FAST_MODEL = "claude-haiku-4-5-20251001"
+_fast_mode: bool = False
+
+
+def _resolve_model(key: str) -> str:
+    """Return the model for an agent, or FAST_MODEL if --fast mode is active."""
+    if _fast_mode:
+        return FAST_MODEL
+    return AGENT_MODELS[key]
+
 
 def _load_agent_prompt(filename: str) -> str:
     """Read agent .md file and return its contents as the system prompt."""
@@ -202,7 +213,7 @@ def communicator_inbound(state: AgentSystemState) -> AgentSystemState:
         }
 
     # ── Normal path: call LLM ─────────────────────────────────────────────
-    ui.agent_header("📨", "Communicator", AGENT_MODELS["communicator"])
+    ui.agent_header("📨", "Communicator", _resolve_model("communicator"))
     prompt = _load_agent_prompt("communicator.md")
     injection = _build_injection(
         today=state.get("today"),
@@ -211,7 +222,7 @@ def communicator_inbound(state: AgentSystemState) -> AgentSystemState:
         project_context=state.get("project_context", ""),
     )
     with ui.spinner("Parsing input..."):
-        packet = _run_agent(prompt, injection, AGENT_MODELS["communicator"])
+        packet = _run_agent(prompt, injection, _resolve_model("communicator"))
     ui.agent_result(packet.get("task_type", "?"), packet.get("task", ""))
     ui.log_link(packet.get("log_ref", ""))
 
@@ -241,7 +252,7 @@ def thinker(state: AgentSystemState) -> AgentSystemState:
     """Produce a reasoned plan. Applies reality anchor, inversion, base rate."""
     retry = state.get("thinker_retry_count", 0)
     retry_tag = f"retry {retry}" if retry > 0 else ""
-    ui.agent_header("🧠", "Thinker", AGENT_MODELS["thinker"], retry_tag)
+    ui.agent_header("🧠", "Thinker", _resolve_model("thinker"), retry_tag)
     prompt = _load_agent_prompt("thinker_v2-2.md")
 
     # Load TELOS only when required by Communicator
@@ -278,7 +289,7 @@ def thinker(state: AgentSystemState) -> AgentSystemState:
         prior_output=prior_output or None,
     )
     with ui.spinner("Planning..."):
-        packet = _run_agent(prompt, injection, AGENT_MODELS["thinker"])
+        packet = _run_agent(prompt, injection, _resolve_model("thinker"))
     ui.agent_result(packet.get("status", "?"), packet.get("summary", ""))
     ui.log_link(packet.get("log_ref", ""))
 
@@ -328,7 +339,7 @@ def thinker(state: AgentSystemState) -> AgentSystemState:
 
 def critic(state: AgentSystemState) -> AgentSystemState:
     """Adversarially review the Thinker's plan. Can reject or approve."""
-    ui.agent_header("⚖️ ", "Critic", AGENT_MODELS["critic"])
+    ui.agent_header("⚖️ ", "Critic", _resolve_model("critic"))
     prompt = _load_agent_prompt("critic.md")
     injection = _build_injection(
         today=state.get("today"),
@@ -339,7 +350,7 @@ def critic(state: AgentSystemState) -> AgentSystemState:
         thinker_log_ref=state.get("thinker_log_ref"),
     )
     with ui.spinner("Reviewing plan..."):
-        packet = _run_agent(prompt, injection, AGENT_MODELS["critic"])
+        packet = _run_agent(prompt, injection, _resolve_model("critic"))
     ui.agent_result(packet.get("verdict", "?"), packet.get("summary", ""))
     ui.log_link(packet.get("log_ref", ""))
 
@@ -363,7 +374,7 @@ def researcher(state: AgentSystemState) -> AgentSystemState:
     """Execute a research commission. Routes back to the commissioning agent."""
     commission = state.get("research_commission", {})
     q = commission.get("question", "")
-    ui.agent_header("🔬", "Researcher", AGENT_MODELS["researcher"], q[:60] + ("…" if len(q) > 60 else ""))
+    ui.agent_header("🔬", "Researcher", _resolve_model("researcher"), q[:60] + ("…" if len(q) > 60 else ""))
     prompt = _load_agent_prompt("researcher.md")
     commission = state.get("research_commission", {})
 
@@ -377,7 +388,7 @@ def researcher(state: AgentSystemState) -> AgentSystemState:
         prior_output=None,
     )
     with ui.spinner("Searching..."):
-        packet = _run_agent(prompt, injection, AGENT_MODELS["researcher"])
+        packet = _run_agent(prompt, injection, _resolve_model("researcher"))
     n = len(packet.get("findings", []))
     ui.agent_result(packet.get("status", "?"), f"{n} finding(s). {packet.get('summary', '')}")
     ui.log_link(packet.get("log_ref", ""))
@@ -435,7 +446,7 @@ def lead_engineer(state: AgentSystemState) -> AgentSystemState:
         prior_qa_failures=json.dumps(state.get("prior_qa_failures", [])),
     )
     with ui.spinner("Decomposing tasks..."):
-        packet = _run_agent(prompt, injection, AGENT_MODELS["lead_engineer"])
+        packet = _run_agent(prompt, injection, _resolve_model("lead_engineer"))
     n = len(packet.get("tasks", []))
     ui.agent_result(packet.get("status", "?"), f"{n} task(s) defined. {packet.get('summary', '')}")
     ui.log_link(packet.get("log_ref", ""))
@@ -475,7 +486,7 @@ def developer(state: AgentSystemState) -> AgentSystemState:
         prior_output=prior_output or None,
     )
     with ui.spinner(f"Implementing {task_id}..."):
-        packet = _run_agent(prompt, injection, AGENT_MODELS["developer"])
+        packet = _run_agent(prompt, injection, _resolve_model("developer"))
     ui.agent_result(packet.get("status", "?"), packet.get("summary", ""))
     ui.log_link(packet.get("log_ref", ""))
 
@@ -510,7 +521,7 @@ def qa(state: AgentSystemState) -> AgentSystemState:
         blocking_threshold=task.get("blocking_threshold", "p0_p1"),
     )
     with ui.spinner(f"Verifying {task_id}..."):
-        packet = _run_agent(prompt, injection, AGENT_MODELS["qa"])
+        packet = _run_agent(prompt, injection, _resolve_model("qa"))
     status = packet.get("status", "?")
     n_fail = len([f for f in packet.get("findings", []) if f.get("severity") in ("p0", "p1")])
     ui.agent_result(status, f"{n_fail} blocking finding(s). {packet.get('summary', '')}")
@@ -560,7 +571,7 @@ def integration_agent(state: AgentSystemState) -> AgentSystemState:
         progress_file=state.get("progress_file"),
         project_context=state.get("project_context", ""),
     )
-    packet = _run_agent(prompt, injection, AGENT_MODELS["integration_agent"])
+    packet = _run_agent(prompt, injection, _resolve_model("integration_agent"))
     ui.agent_result(packet.get("status", "?"), packet.get("summary", ""))
     log_ref = packet.get("log_ref", "")
     ui.log_link(log_ref)
@@ -588,7 +599,7 @@ def system_improvement_agent(state: AgentSystemState) -> AgentSystemState:
         project_context=state.get("project_context", ""),
     )
     with ui.spinner("SIA auditing system logs..."):
-        packet = _run_agent(prompt, injection, AGENT_MODELS["system_improvement_agent"])
+        packet = _run_agent(prompt, injection, _resolve_model("system_improvement_agent"))
     ui.agent_result(packet.get("system_health", "?"), packet.get("summary", ""))
     ui.log_link(packet.get("log_ref", ""))
 
@@ -639,7 +650,7 @@ def human_checkpoint(state: AgentSystemState) -> AgentSystemState:
 
 def communicator_outbound(state: AgentSystemState) -> AgentSystemState:
     """Format final output for the human and mark workflow complete."""
-    ui.agent_header("📤", "Communicator", AGENT_MODELS["communicator"], "outbound")
+    ui.agent_header("📤", "Communicator", _resolve_model("communicator"), "outbound")
     prompt = _load_agent_prompt("communicator.md")
     # If this is a synthesis run, surface the artifact path explicitly
     artifact_path = state.get("thinker_packet", {}).get("artifact_path")
@@ -651,7 +662,7 @@ def communicator_outbound(state: AgentSystemState) -> AgentSystemState:
         artifact_path=artifact_path,  # None → skipped by _build_injection
         project_context=state.get("project_context", ""),
     )
-    _run_agent_raw(prompt, injection, AGENT_MODELS["communicator"])  # Prints human-readable text
+    _run_agent_raw(prompt, injection, _resolve_model("communicator"))  # Prints human-readable text
     flow = state.get("agent_flow", []) + ["output"]
     ui.flow_summary(flow)
     return {"completed": True, "agent_flow": flow}
@@ -1344,7 +1355,12 @@ if __name__ == "__main__":
     parser.add_argument(      "--list",    action="store_true", help="List all runs and their status")
     parser.add_argument(      "--end",     metavar="NAME",   help="Delete a specific run's checkpoint data")
     parser.add_argument(      "--end-all", action="store_true", help="Delete all checkpoint data")
+    parser.add_argument(      "--fast",    action="store_true", help="Use Haiku for all agents (faster/cheaper)")
     args = parser.parse_args()
+
+    if args.fast:
+        globals()["_fast_mode"] = True
+        ui.console.print(f"[dim yellow]⚡ Fast mode — all agents using {FAST_MODEL}[/dim yellow]")
 
     with SqliteSaver.from_conn_string(CHECKPOINT_DB) as checkpointer:
 
