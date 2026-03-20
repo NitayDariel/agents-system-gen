@@ -4,6 +4,8 @@
 
 # Runtime checkpoint state (local only)
 checkpoint.db
+checkpoint.db-shm
+checkpoint.db-wal
 
 # Agent run logs (generated output, not source)
 logs/
