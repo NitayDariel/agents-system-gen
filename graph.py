@@ -25,7 +25,10 @@ Or with human-in-the-loop:
 """
 
 import json
+import queue
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -968,62 +971,252 @@ def _resolve_option_letters(human_input: str, question_text: str) -> str:
     return result
 
 
-def _run_interrupt_loop(app, config: dict, thread_id: str) -> None:
-    """Handle the interactive checkpoint loop until the graph reaches END."""
+def _handle_explore_command(cmd: str, app, config: dict) -> None:
+    """
+    Process a live exploration command typed while agents are running.
+    Reads current graph state and prints results to the scrollback area
+    above the live status panel. Does NOT block the background thread.
+    """
+    from rich.panel import Panel as _Panel
+
+    snapshot = app.get_state(config)
+    state = snapshot.values if snapshot else {}
+
+    findings = (state.get("researcher_packet") or {}).get("findings", [])
+    plan = (state.get("thinker_packet") or {}).get("plan", [])
+    pending = state.get("pending_research") or []
+    flow = state.get("agent_flow") or []
+    assumptions = (state.get("thinker_packet") or {}).get("open_assumptions", [])
+
+    cmd = cmd.strip().lower()
+
+    if cmd in ("help", "?", "h"):
+        ui.console.print(
+            "[dim]Commands: findings · plan · flow · queue · assumptions · "
+            "f1-fN · p1-pN · state[/dim]"
+        )
+    elif cmd == "findings":
+        if not findings:
+            ui.console.print("[dim]No findings yet.[/dim]")
+        else:
+            for i, f in enumerate(findings, 1):
+                ct = f.get("claim_type", "")
+                cl = f.get("claim", str(f))[:120]
+                ui.console.print(f"  [dim]{i}.[/dim] [blue]{ct}[/blue]  {cl}")
+    elif cmd == "plan":
+        if not plan:
+            ui.console.print("[dim]No plan yet.[/dim]")
+        else:
+            for i, step in enumerate(plan, 1):
+                desc = step.get("description", str(step))[:120]
+                agent = step.get("assigned_to", "")
+                ui.console.print(f"  [dim]{i}.[/dim] [magenta]{agent}[/magenta]  {desc}")
+    elif cmd == "flow":
+        if not flow:
+            ui.console.print("[dim]No agent flow yet.[/dim]")
+        else:
+            ui.console.print("  " + " → ".join(flow))
+    elif cmd == "queue":
+        if not pending:
+            ui.console.print("[dim]No pending research.[/dim]")
+        else:
+            ui.console.print(f"  [dim]{len(pending)} commission(s) queued[/dim]")
+            for i, p in enumerate(pending, 1):
+                label = p.get("commission_label", p.get("description", str(p)))[:100]
+                ui.console.print(f"  [dim]{i}.[/dim] {label}")
+    elif cmd == "assumptions":
+        if not assumptions:
+            ui.console.print("[dim]No open assumptions.[/dim]")
+        else:
+            for i, a in enumerate(assumptions, 1):
+                ui.console.print(f"  [dim]{i}.[/dim] {str(a)[:120]}")
+    elif cmd == "state":
+        keys = ["thinker_status", "researcher_status", "critic_status",
+                "lead_engineer_status", "developer_status", "qa_status"]
+        for k in keys:
+            v = state.get(k)
+            if v:
+                ui.console.print(f"  [dim]{k}:[/dim] {v}")
+    elif cmd.startswith("f") and cmd[1:].isdigit():
+        idx = int(cmd[1:]) - 1
+        if 0 <= idx < len(findings):
+            f = findings[idx]
+            lines = "\n".join(
+                f"  [dim]{k}:[/dim]  {str(v)[:200]}"
+                for k, v in f.items()
+            )
+            ui.console.print(_Panel(lines, title=f"[blue]Finding {idx+1} of {len(findings)}[/blue]",
+                                    border_style="dim blue"))
+        else:
+            ui.console.print(f"[dim]Finding {idx+1} not found (have {len(findings)})[/dim]")
+    elif cmd.startswith("p") and cmd[1:].isdigit():
+        idx = int(cmd[1:]) - 1
+        if 0 <= idx < len(plan):
+            step = plan[idx]
+            lines = "\n".join(
+                f"  [dim]{k}:[/dim]  {str(v)[:200]}"
+                for k, v in step.items()
+            )
+            ui.console.print(_Panel(lines, title=f"[magenta]Plan Step {idx+1} of {len(plan)}[/magenta]",
+                                    border_style="dim magenta"))
+        else:
+            ui.console.print(f"[dim]Step {idx+1} not found (have {len(plan)})[/dim]")
+    else:
+        ui.console.print(f"[dim]Unknown: {cmd!r}. Type help for commands.[/dim]")
+
+
+def _handle_interrupt(app, config: dict, snapshot) -> str:
+    """
+    Render the appropriate panel for an interrupt, run the inspect REPL,
+    and return the human response string.
+
+    Called from the main thread while the graph thread is blocked.
+    """
+    state_vals = snapshot.values
+    checkpoint_type = state_vals.get("checkpoint_type", "")
+
+    # Check if this pause is a communicator clarification (early, pre-Thinker)
+    clarification_interrupt = None
+    for task in snapshot.tasks:
+        for irpt in getattr(task, "interrupts", []):
+            val = getattr(irpt, "value", None)
+            if isinstance(val, dict) and val.get("stage") == "clarification":
+                clarification_interrupt = val
+                break
+
+    if clarification_interrupt:
+        ui.clarification_panel(clarification_interrupt.get("question", ""))
+    elif checkpoint_type == "thinker_needs_clarification":
+        thinker_pkt = state_vals.get("thinker_packet", {})
+        blockers = thinker_pkt.get("blockers", [])
+        ui.checkpoint_panel(
+            "Thinker needs clarification",
+            blockers=blockers,
+            prompt_text="Answer the above (or 'proceed' to let the system assume):",
+        )
+    elif checkpoint_type == "synthesis_needs_clarification":
+        thinker_pkt = state_vals.get("thinker_packet", {})
+        blockers = thinker_pkt.get("blockers", [])
+        ui.checkpoint_panel(
+            "Synthesis — open questions",
+            blockers=blockers,
+            prompt_text="Answer the above (or 'proceed' to synthesize with best assumptions):",
+        )
+    else:
+        ui.checkpoint_panel(
+            state_vals.get("checkpoint_stage", "unknown"),
+            options=["proceed", "pause", "redirect"],
+        )
+
+    # Inspect REPL — user can drill into findings/plan before responding
+    human_response = ui.inspect_repl(state_vals) or "proceed"
+
+    if clarification_interrupt:
+        human_response = _resolve_option_letters(
+            human_response,
+            clarification_interrupt.get("question", ""),
+        )
+        app.update_state(config, {"resolved_clarification": human_response})
+
+    return human_response
+
+
+def _graph_worker(app, config: dict, event_q: "queue.Queue", response_q: "queue.Queue") -> None:
+    """
+    Background thread: drives the LangGraph graph to completion.
+
+    Protocol:
+      - Runs app.invoke() until the graph has no pending nodes
+      - On each interrupt: puts snapshot onto event_q, blocks on response_q
+      - On completion: puts None onto event_q and exits
+    """
+    cmd = None  # first invoke uses initial state (already invoked before thread starts)
     while True:
         snapshot = app.get_state(config)
         if not snapshot.next:
-            break
-
-        state_vals = snapshot.values
-        checkpoint_type = state_vals.get("checkpoint_type", "")
-
-        # Check if this pause is a communicator clarification (early, pre-Thinker)
-        clarification_interrupt = None
-        for task in snapshot.tasks:
-            for irpt in getattr(task, "interrupts", []):
-                val = getattr(irpt, "value", None)
-                if isinstance(val, dict) and val.get("stage") == "clarification":
-                    clarification_interrupt = val
-                    break
-
-        if clarification_interrupt:
-            ui.clarification_panel(clarification_interrupt.get("question", ""))
-        elif checkpoint_type == "thinker_needs_clarification":
-            thinker_pkt = state_vals.get("thinker_packet", {})
-            blockers = thinker_pkt.get("blockers", [])
-            ui.checkpoint_panel(
-                "Thinker needs clarification",
-                blockers=blockers,
-                prompt_text="Answer the above (or 'proceed' to let the system assume):",
-            )
-        elif checkpoint_type == "synthesis_needs_clarification":
-            thinker_pkt = state_vals.get("thinker_packet", {})
-            blockers = thinker_pkt.get("blockers", [])
-            ui.checkpoint_panel(
-                "Synthesis — open questions",
-                blockers=blockers,
-                prompt_text="Answer the above (or 'proceed' to synthesize with best assumptions):",
-            )
-        else:
-            ui.checkpoint_panel(
-                state_vals.get("checkpoint_stage", "unknown"),
-                options=["proceed", "pause", "redirect"],
-            )
-
-        human_response = ui.console.input("[dim]>[/dim] ").strip() or "proceed"
-
-        if clarification_interrupt:
-            # Resolve any letter shorthand (e.g. "a" → full option text) deterministically.
-            human_response = _resolve_option_letters(
-                human_response,
-                clarification_interrupt.get("question", ""),
-            )
-            # Write resolved answer to state NOW — communicator_inbound reads this on
-            # resume and skips the LLM entirely (deterministic, zero second LLM call).
-            app.update_state(config, {"resolved_clarification": human_response})
-
+            event_q.put(None)  # signal completion
+            return
+        # Signal interrupt to main thread
+        event_q.put(snapshot)
+        # Block until main thread sends response
+        human_response = response_q.get()
+        # Resume graph
         app.invoke(Command(resume=human_response), config=config)
+
+
+def _run_interrupt_loop(app, config: dict, thread_id: str) -> None:
+    """
+    Handle the interactive checkpoint loop until the graph reaches END.
+
+    When ui.LIVE_DISPLAY is True: runs graph on a background thread, main thread
+    manages the live status panel and handles interrupt prompts.
+    When ui.LIVE_DISPLAY is False: runs graph synchronously (Phase 2 behaviour).
+    """
+    if not ui.LIVE_DISPLAY:
+        # ── Synchronous fallback (Phase 2 behaviour) ─────────────────────
+        while True:
+            snapshot = app.get_state(config)
+            if not snapshot.next:
+                break
+            human_response = _handle_interrupt(app, config, snapshot)
+            app.invoke(Command(resume=human_response), config=config)
+        ui.run_complete(thread_id)
+        return
+
+    # ── Two-thread model ─────────────────────────────────────────────────
+    # Check if graph is already done (no pending nodes)
+    snapshot = app.get_state(config)
+    if not snapshot.next:
+        ui.run_complete(thread_id)
+        return
+
+    event_q: queue.Queue = queue.Queue()
+    response_q: queue.Queue = queue.Queue()
+
+    # Start graph worker thread
+    worker = threading.Thread(
+        target=_graph_worker,
+        args=(app, config, event_q, response_q),
+        daemon=True,
+    )
+    worker.start()
+
+    import select
+    import sys
+
+    try:
+        while True:
+            # Idle loop: refresh live panel + poll stdin for explore commands
+            while event_q.empty():
+                if ui._live is not None:
+                    ui._live.update(ui._make_status_panel())
+                # Non-blocking stdin check — lets users explore state while agents run
+                if sys.stdin.isatty():
+                    r, _, _ = select.select([sys.stdin], [], [], 0.1)
+                    if r:
+                        ui.live_pause()
+                        line = sys.stdin.readline().strip()
+                        if line:
+                            _handle_explore_command(line, app, config)
+                        ui.live_resume()
+                else:
+                    time.sleep(0.25)
+
+            event = event_q.get()
+
+            if event is None:
+                # Graph completed
+                break
+
+            # Interrupt — pause live display, handle interactively, resume
+            snapshot = event
+            ui.live_pause()
+            human_response = _handle_interrupt(app, config, snapshot)
+            response_q.put(human_response)
+            ui.live_resume()
+
+    finally:
+        worker.join(timeout=5)
 
     ui.run_complete(thread_id)
 
@@ -1201,14 +1394,14 @@ if __name__ == "__main__":
                         "decision_journal": "./improvement/decision_journal.json",
                         "prior_backlog": "./improvement/backlog.json",
                     }
-                    ui.run_start(follow_id, f"[Follow-up from: {thread_id}] {args.task}")
+                    ui.run_start(follow_id, f"[Follow-up from: {thread_id}] {args.task}", logs_dir="./logs")
                     follow_app = build_app(checkpointer)
                     follow_app.invoke(follow_state, config=follow_config)
                     _run_interrupt_loop(follow_app, follow_config, follow_id)
                 else:
                     print(f"Run '{thread_id}' is already complete. Pass a task to start a follow-up run.")
                 sys.exit(0)
-            ui.run_start(thread_id, f"[Resume] {args.task or '...'}")
+            ui.run_start(thread_id, f"[Resume] {args.task or '...'}", logs_dir="./logs")
             if args.task:
                 app.invoke(Command(resume=args.task), config=config)
             _run_interrupt_loop(app, config, thread_id)
@@ -1246,7 +1439,8 @@ if __name__ == "__main__":
             "prior_backlog": "./improvement/backlog.json",
         }
 
-        ui.run_start(thread_id, args.task)
+        logs_dir = initial_state.get("logs_directory", "./logs")
+        ui.run_start(thread_id, args.task, logs_dir=logs_dir)
         app = build_app(checkpointer)
         app.invoke(initial_state, config=config)
         _run_interrupt_loop(app, config, thread_id)
